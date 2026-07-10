@@ -14,7 +14,7 @@ dependencies = [
     "pydantic-settings",
     "pyjwt",
     "python-multipart",
-    "sqlalchemy",
+    "sqlalchemy[asyncio]",
     "uvicorn",
 ]
 
