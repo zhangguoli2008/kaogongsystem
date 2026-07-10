@@ -14,10 +14,16 @@ DerivedData/
 Pods/
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
 .venv/
 venv/
 target/
 out/
 *.class
+.next/
+coverage/
 .worktrees/
 .superpowers/
