@@ -4,6 +4,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Final
 from uuid import uuid4
+import warnings
 
 from fastapi import UploadFile
 from PIL import Image, UnidentifiedImageError
@@ -17,6 +18,8 @@ ALLOWED_FORMATS: Final[dict[str, tuple[str, str]]] = {
 ALLOWED_MIME_TYPES: Final[frozenset[str]] = frozenset(
     mime for mime, _extension in ALLOWED_FORMATS.values()
 )
+MAX_IMAGE_PIXELS: Final[int] = 25_000_000
+MAX_ORIGINAL_NAME_BYTES: Final[int] = 500
 
 
 class UnsupportedImageType(Exception):
@@ -31,19 +34,38 @@ class UploadTooLarge(Exception):
     """The payload exceeded the configured upload limit."""
 
 
+class FilenameTooLong(Exception):
+    """The client-provided display name exceeds the metadata limit."""
+
+
+class InvalidFilename(Exception):
+    """The client-provided display name contains control characters."""
+
+
 def inspect_image(raw: bytes) -> tuple[str, str]:
     """Verify and fully decode an image, returning canonical MIME and suffix."""
 
     try:
-        # verify() checks the file structure without decoding pixels.  A second
-        # open is required because verify() invalidates the image object.
-        with Image.open(BytesIO(raw)) as image:
-            image.verify()
-        with Image.open(BytesIO(raw)) as image:
-            detected = image.format
-            image.load()
+        # Treat Pillow's decompression-bomb warning as an error.  The explicit
+        # dimension check also enforces a lower, application-specific limit
+        # where Pillow itself would otherwise only emit a warning at a much
+        # larger default threshold.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            # verify() checks the file structure without decoding pixels.  A
+            # second open is required because verify() invalidates the object.
+            with Image.open(BytesIO(raw)) as image:
+                if image.width * image.height > MAX_IMAGE_PIXELS:
+                    raise InvalidImage
+                image.verify()
+            with Image.open(BytesIO(raw)) as image:
+                if image.width * image.height > MAX_IMAGE_PIXELS:
+                    raise InvalidImage
+                detected = image.format
+                image.load()
     except (
         UnidentifiedImageError,
+        Image.DecompressionBombWarning,
         Image.DecompressionBombError,
         OSError,
         ValueError,
@@ -72,6 +94,12 @@ async def save_image(
     if file.content_type and file.content_type not in ALLOWED_MIME_TYPES:
         raise UnsupportedImageType
 
+    original_name = file.filename or "upload"
+    if any(ord(char) < 32 or ord(char) == 127 for char in original_name):
+        raise InvalidFilename
+    if len(original_name.encode("utf-8")) > MAX_ORIGINAL_NAME_BYTES:
+        raise FilenameTooLong
+
     raw = await file.read(max_upload_bytes + 1)
     if len(raw) > max_upload_bytes:
         raise UploadTooLarge
@@ -85,7 +113,7 @@ async def save_image(
     if target.parent.resolve() != upload_dir.resolve():
         raise InvalidImage
     target.write_bytes(raw)
-    return storage_name, mime_type, file.filename or "upload", len(raw)
+    return storage_name, mime_type, original_name, len(raw)
 
 
 def image_path(upload_dir: Path, storage_name: str) -> Path:

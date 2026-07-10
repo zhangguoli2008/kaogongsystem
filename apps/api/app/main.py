@@ -14,6 +14,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = resolved
     app.state.session_factory = create_session_factory(resolved.database_url)
     app.state.auth_rate_limiter = RateLimiter(limit=10, window_seconds=60)
+    # Keep provider throttling separate so future analysis calls can share the
+    # same bounded state without affecting authentication limits.
+    app.state.provider_rate_limiter = RateLimiter(limit=10, window_seconds=60)
     app.add_middleware(UnexpectedErrorMiddleware)
     # Added last so the configured CORS policy also wraps unexpected responses.
     app.add_middleware(

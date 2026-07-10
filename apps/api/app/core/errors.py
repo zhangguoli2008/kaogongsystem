@@ -25,8 +25,20 @@ class APIError(Exception):
         self.field_errors = field_errors
 
 
+def request_id_for(request: Request) -> str:
+    """Return one request ID shared by handlers, provider logs and responses."""
+
+    existing = getattr(request.state, "request_id", None)
+    if existing:
+        return existing
+    resolved = request.headers.get("X-Request-ID") or str(uuid4())
+    request.state.request_id = resolved
+    return resolved
+
+
 def _request_id(request: Request) -> str:
-    return request.headers.get("X-Request-ID") or str(uuid4())
+    # Kept as a private compatibility alias for existing error middleware code.
+    return request_id_for(request)
 
 
 def _error_response(

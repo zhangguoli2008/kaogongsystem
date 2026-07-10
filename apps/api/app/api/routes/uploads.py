@@ -14,6 +14,8 @@ from app.models.upload import UploadedAsset
 from app.schemas.upload import UploadRead
 from app.services.storage import (
     InvalidImage,
+    InvalidFilename,
+    FilenameTooLong,
     UnsupportedImageType,
     UploadTooLarge,
     image_path,
@@ -46,6 +48,10 @@ async def upload_question_image(
         raise APIError(400, "invalid_image", "图片文件损坏或无法解析") from exc
     except UploadTooLarge as exc:
         raise APIError(413, "upload_too_large", "图片大小超过限制") from exc
+    except FilenameTooLong as exc:
+        raise APIError(400, "filename_too_long", "文件名过长") from exc
+    except InvalidFilename as exc:
+        raise APIError(400, "filename_invalid", "文件名包含非法字符") from exc
 
     asset = UploadedAsset(
         user_id=current_user.id,

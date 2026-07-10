@@ -22,7 +22,7 @@ class UploadedAsset(Base):
         String(36), primary_key=True, default=lambda: str(uuid4())
     )
     user_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
     )
     storage_name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     original_name: Mapped[str] = mapped_column(String(500), nullable=False)

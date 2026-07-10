@@ -7,8 +7,23 @@ import pytest
 from openai import APIConnectionError
 
 from app.core.errors import APIError
+from app.core.errors import request_id_for
 from app.services.providers.demo import DemoProvider
 from app.services.providers.openai import OpenAIProvider
+from starlette.requests import Request
+
+
+def test_request_id_helper_reuses_header_and_generated_value():
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/ocr",
+            "headers": [(b"x-request-id", b"local-header")],
+        }
+    )
+    assert request_id_for(request) == "local-header"
+    assert request_id_for(request) == "local-header"
 
 
 def test_demo_provider_has_four_options():
@@ -46,11 +61,12 @@ def test_openai_provider_sends_data_url_and_strict_schema():
     assert seen["text"]["format"]["type"] == "json_schema"
     assert seen["text"]["format"]["strict"] is True
     assert seen["text"]["format"]["schema"]["additionalProperties"] is False
+    assert "user_answer" in seen["text"]["format"]["schema"]["required"]
     option_schema = seen["text"]["format"]["schema"]["$defs"]["QuestionOption"]
     assert option_schema["additionalProperties"] is False
 
 
-def test_openai_connection_errors_map_to_stable_api_error():
+def test_openai_connection_errors_map_to_stable_api_error(caplog):
     class FakeResponses:
         async def create(self, **kwargs):
             request = httpx.Request("POST", "https://api.openai.com/v1/responses")
@@ -61,5 +77,23 @@ def test_openai_connection_errors_map_to_stable_api_error():
 
     provider = OpenAIProvider(api_key="test", client=FakeClient())
     with pytest.raises(APIError) as caught:
-        asyncio.run(provider.ocr(b"hello", "image/png"))
+        with caplog.at_level("WARNING"):
+            asyncio.run(provider.ocr(b"hello", "image/png", request_id="local-123"))
     assert caught.value.code == "provider_connection_error"
+    assert any(
+        getattr(record, "local_request_id", None) == "local-123"
+        for record in caplog.records
+    )
+
+
+def test_openai_client_disables_sdk_retries(monkeypatch):
+    seen = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+    monkeypatch.setattr("app.services.providers.openai.AsyncOpenAI", FakeClient)
+    OpenAIProvider(api_key="test")
+    assert seen["max_retries"] == 0
+    assert seen["timeout"] == 60.0

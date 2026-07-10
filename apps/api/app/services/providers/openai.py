@@ -30,13 +30,25 @@ class OpenAIProvider:
         api_key: str,
         model: str = "gpt-5.5",
         client: Any | None = None,
+        request_id: str | None = None,
     ) -> None:
         self.model = model
-        self.client = client or AsyncOpenAI(api_key=api_key)
+        self.request_id = request_id
+        self.client = client or AsyncOpenAI(
+            api_key=api_key,
+            max_retries=0,
+            timeout=60.0,
+        )
 
-    async def ocr(self, image_bytes: bytes, mime_type: str) -> OcrResult:
+    async def ocr(
+        self,
+        image_bytes: bytes,
+        mime_type: str,
+        request_id: str | None = None,
+    ) -> OcrResult:
         encoded = base64.b64encode(image_bytes).decode()
         data_url = f"data:{mime_type};base64,{encoded}"
+        local_request_id = request_id or self.request_id
         try:
             response = await self.client.responses.create(
                 model=self.model,
@@ -60,45 +72,81 @@ class OpenAIProvider:
                 },
             )
         except APITimeoutError as exc:
-            self._log_provider_error(exc, "timeout")
+            self._log_provider_error(exc, "timeout", local_request_id=local_request_id)
             raise APIError(504, "provider_timeout", "OCR 服务响应超时") from exc
         except APIConnectionError as exc:
-            self._log_provider_error(exc, "connection")
+            self._log_provider_error(
+                exc, "connection", local_request_id=local_request_id
+            )
             raise APIError(502, "provider_connection_error", "OCR 服务连接失败") from exc
         except RateLimitError as exc:
-            self._log_provider_error(exc, "rate_limit")
+            self._log_provider_error(
+                exc, "rate_limit", local_request_id=local_request_id
+            )
             raise APIError(429, "provider_rate_limited", "OCR 服务请求过于频繁") from exc
         except APIStatusError as exc:
             self._log_provider_error(
-                exc, "status", getattr(exc.response, "status_code", None)
+                exc,
+                "status",
+                getattr(exc.response, "status_code", None),
+                local_request_id=local_request_id,
             )
             status = getattr(exc.response, "status_code", 502)
             code = "provider_rate_limited" if status == 429 else "provider_api_error"
             raise APIError(429 if status == 429 else 502, code, "OCR 服务暂时不可用") from exc
         except Exception as exc:
             # Do not leak SDK or response details through the API boundary.
-            self._log_provider_error(exc, "unexpected")
+            self._log_provider_error(
+                exc, "unexpected", local_request_id=local_request_id
+            )
             raise APIError(502, "provider_api_error", "OCR 服务暂时不可用") from exc
 
         try:
             result = OcrResult.model_validate_json(response.output_text)
         except (AttributeError, TypeError, ValueError) as exc:
+            self._log_provider_metadata(
+                category="invalid_response",
+                provider_request_id=getattr(response, "_request_id", None),
+                status_code=getattr(response, "status_code", 200),
+                local_request_id=local_request_id,
+            )
             raise APIError(502, "provider_invalid_response", "OCR 服务返回内容无效") from exc
         return result.model_copy(update={"is_demo": False})
 
     def _log_provider_error(
-        self, error: Exception, category: str, status_code: int | None = None
+        self,
+        error: Exception,
+        category: str,
+        status_code: int | None = None,
+        *,
+        local_request_id: str | None = None,
     ) -> None:
         response = getattr(error, "response", None)
-        request_id = (
+        provider_request_id = (
             getattr(response, "headers", {}).get("x-request-id") if response else None
         )
+        self._log_provider_metadata(
+            category=category,
+            provider_request_id=provider_request_id,
+            status_code=status_code,
+            local_request_id=local_request_id,
+        )
+
+    @staticmethod
+    def _log_provider_metadata(
+        *,
+        category: str,
+        provider_request_id: str | None,
+        status_code: int | None,
+        local_request_id: str | None,
+    ) -> None:
         logger.warning(
             "OpenAI provider request failed",
             extra={
                 "provider_category": category,
-                "provider_request_id": request_id,
+                "provider_request_id": provider_request_id,
                 "provider_status_code": status_code,
+                "local_request_id": local_request_id,
             },
         )
 

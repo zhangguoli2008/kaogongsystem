@@ -7,8 +7,13 @@ from app.schemas.upload import OcrResult
 class DemoProvider:
     """Deterministic offline provider used by local demos and tests."""
 
-    async def ocr(self, image_bytes: bytes, mime_type: str) -> OcrResult:
-        del image_bytes, mime_type
+    async def ocr(
+        self,
+        image_bytes: bytes,
+        mime_type: str,
+        request_id: str | None = None,
+    ) -> OcrResult:
+        del image_bytes, mime_type, request_id
         return OcrResult(
             stem="某地区2024年第一季度生产总值为120亿元，第二季度比第一季度增长10%，第二季度生产总值为多少亿元？",
             options=[

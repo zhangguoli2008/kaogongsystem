@@ -27,7 +27,7 @@ class OcrResult(BaseModel):
 
     stem: str = Field(min_length=1)
     options: list[QuestionOption] = Field(min_length=1)
-    user_answer: str = ""
+    user_answer: str
     correct_answer: str = Field(min_length=1)
     original_explanation: str = Field(min_length=1)
     raw_text: str = Field(min_length=1)
