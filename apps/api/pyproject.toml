@@ -21,6 +21,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "aiosqlite",
+    "httpx2>=2.0.0",
     "pytest",
     "pytest-cov",
 ]
