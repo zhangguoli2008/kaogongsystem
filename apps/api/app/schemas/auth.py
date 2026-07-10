@@ -1,12 +1,15 @@
 from datetime import datetime
 
+from email_validator import EmailNotValidError, validate_email
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 def normalize_email(value: str) -> str:
     normalized = value.strip().casefold()
-    if "@" not in normalized:
-        raise ValueError("must be a valid email address")
+    try:
+        validate_email(normalized, check_deliverability=False)
+    except EmailNotValidError as exc:
+        raise ValueError("must be a valid email address") from exc
     return normalized
 
 

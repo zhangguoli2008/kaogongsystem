@@ -5,6 +5,7 @@ description = "Backend API for the AI exam diagnosis system"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "alembic",
+    "email-validator",
     "fastapi",
     "httpx",
     "openai",

@@ -17,6 +17,8 @@ class UserSettings(Base):
     user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
     )
-    daily_review_limit: Mapped[int] = mapped_column(Integer, default=20)
+    daily_review_limit: Mapped[int] = mapped_column(
+        Integer, default=20, server_default="20"
+    )
 
     user: Mapped[User] = relationship(back_populates="settings")
