@@ -9,6 +9,8 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from app.models.base import Base
 from app.models.review import UserSettings  # noqa: F401
 from app.models.user import User  # noqa: F401
+from app.models.question import Question  # noqa: F401
+from app.models.analysis import Analysis  # noqa: F401
 
 config = context.config
 
