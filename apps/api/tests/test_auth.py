@@ -183,22 +183,37 @@ def test_validation_errors_use_standard_error_shape(client):
     }
 
 
-def test_unexpected_errors_use_standard_non_leaking_shape(test_settings, caplog):
+def _app_with_internal_error(test_settings):
     app = create_app(test_settings)
 
     @app.get("/test/internal-error")
     async def internal_error():
         raise RuntimeError("sensitive internal detail")
 
+    return app
+
+
+def test_unexpected_errors_use_standard_non_leaking_shape_with_cors(
+    test_settings, caplog
+):
+    app = _app_with_internal_error(test_settings)
+    allowed_origin = test_settings.allowed_origins[0]
+
     with caplog.at_level(logging.ERROR, logger="app.core.errors"):
         with TestClient(app, raise_server_exceptions=False) as test_client:
             response = test_client.get(
-                "/test/internal-error", headers={"X-Request-ID": "internal-request"}
+                "/test/internal-error",
+                headers={
+                    "Origin": allowed_origin,
+                    "X-Request-ID": "internal-request",
+                },
             )
 
     assert response.status_code == 500
     assert response.headers["content-type"].startswith("application/json")
     assert response.headers["X-Request-ID"] == "internal-request"
+    assert response.headers.get("Access-Control-Allow-Origin") == allowed_origin
+    assert response.headers.get("Access-Control-Allow-Credentials") == "true"
     assert response.json() == {
         "code": "internal_server_error",
         "message": "服务器内部错误",
@@ -211,6 +226,24 @@ def test_unexpected_errors_use_standard_non_leaking_shape(test_settings, caplog)
         and isinstance(record.exc_info[1], RuntimeError)
         and str(record.exc_info[1]) == "sensitive internal detail"
         for record in caplog.records
+    )
+    assert any(
+        getattr(record, "request_id", None) == "internal-request"
+        for record in caplog.records
+    )
+
+
+def test_unexpected_errors_share_generated_request_id_with_log(test_settings, caplog):
+    app = _app_with_internal_error(test_settings)
+
+    with caplog.at_level(logging.ERROR, logger="app.core.errors"):
+        with TestClient(app, raise_server_exceptions=False) as test_client:
+            response = test_client.get("/test/internal-error")
+
+    request_id = response.json()["request_id"]
+    assert response.headers["X-Request-ID"] == request_id
+    assert any(
+        getattr(record, "request_id", None) == request_id for record in caplog.records
     )
 
 

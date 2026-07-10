@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import api_router
 from app.core.config import Settings, get_settings
 from app.core.database import create_session_factory
-from app.core.errors import install_error_handlers
+from app.core.errors import UnexpectedErrorMiddleware, install_error_handlers
 from app.core.rate_limit import RateLimiter
 
 
@@ -14,6 +14,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = resolved
     app.state.session_factory = create_session_factory(resolved.database_url)
     app.state.auth_rate_limiter = RateLimiter(limit=10, window_seconds=60)
+    app.add_middleware(UnexpectedErrorMiddleware)
+    # Added last so the configured CORS policy also wraps unexpected responses.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=resolved.allowed_origins,

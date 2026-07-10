@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 
@@ -35,18 +36,47 @@ def _error_response(
     code: str,
     message: str,
     field_errors: dict[str, list[str]] | None = None,
+    request_id: str | None = None,
 ) -> JSONResponse:
-    request_id = _request_id(request)
+    resolved_request_id = request_id or _request_id(request)
     return JSONResponse(
         status_code=status_code,
         content={
             "code": code,
             "message": message,
             "field_errors": field_errors,
-            "request_id": request_id,
+            "request_id": resolved_request_id,
         },
-        headers={"X-Request-ID": request_id},
+        headers={"X-Request-ID": resolved_request_id},
     )
+
+
+class UnexpectedErrorMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        try:
+            await self.app(scope, receive, send)
+        except Exception:
+            request = Request(scope)
+            request_id = _request_id(request)
+            logger.exception(
+                "Unhandled application exception",
+                extra={"request_id": request_id},
+            )
+            response = _error_response(
+                request,
+                status_code=500,
+                code="internal_server_error",
+                message="服务器内部错误",
+                request_id=request_id,
+            )
+            await response(scope, receive, send)
 
 
 def install_error_handlers(app: FastAPI) -> None:
@@ -87,19 +117,4 @@ def install_error_handlers(app: FastAPI) -> None:
             status_code=exc.status_code,
             code=code,
             message=str(exc.detail),
-        )
-
-    @app.exception_handler(Exception)
-    async def handle_unexpected_error(
-        request: Request, exc: Exception
-    ) -> JSONResponse:
-        logger.error(
-            "Unhandled application exception",
-            exc_info=(type(exc), exc, exc.__traceback__),
-        )
-        return _error_response(
-            request,
-            status_code=500,
-            code="internal_server_error",
-            message="服务器内部错误",
         )
