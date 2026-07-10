@@ -10,6 +10,10 @@ from app.core.rate_limit import RateLimiter
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved = settings or get_settings()
+    # Validate live-provider credentials before serving any traffic.  Deferring
+    # this check to an OCR request would turn an operator misconfiguration into
+    # a user-facing 500 response.
+    provider_mode = resolved.effective_provider_mode
     app = FastAPI(title="AI 公考错题诊断系统")
     app.state.settings = resolved
     app.state.session_factory = create_session_factory(resolved.database_url)
@@ -31,7 +35,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/health")
     async def health() -> dict[str, str]:
-        return {"status": "ok", "provider_mode": resolved.effective_provider_mode}
+        return {"status": "ok", "provider_mode": provider_mode}
 
     return app
 
