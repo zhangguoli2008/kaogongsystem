@@ -11,6 +11,7 @@ from app.models.review import UserSettings  # noqa: F401
 from app.models.user import User  # noqa: F401
 from app.models.question import Question  # noqa: F401
 from app.models.analysis import Analysis  # noqa: F401
+from app.models.upload import UploadedAsset  # noqa: F401
 
 config = context.config
 

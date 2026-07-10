@@ -41,8 +41,14 @@ def test_wrong_question_migration_supports_fresh_existing_and_downgrade(tmp_path
     fresh = tmp_path / "fresh.db"
     run_alembic(fresh, "upgrade", "head")
     run_alembic(fresh, "check")
-    assert version(fresh) == "0002_wrong_question_library"
-    assert {"users", "user_settings", "questions", "analyses"} <= schema(fresh)
+    assert version(fresh) == "0003_uploaded_assets"
+    assert {
+        "users",
+        "user_settings",
+        "questions",
+        "analyses",
+        "uploaded_assets",
+    } <= schema(fresh)
 
     existing = tmp_path / "existing.db"
     run_alembic(existing, "upgrade", "0001_initial")
@@ -52,10 +58,10 @@ def test_wrong_question_migration_supports_fresh_existing_and_downgrade(tmp_path
 
     run_alembic(existing, "upgrade", "head")
     run_alembic(existing, "check")
-    assert version(existing) == "0002_wrong_question_library"
-    assert {"questions", "analyses"} <= schema(existing)
+    assert version(existing) == "0003_uploaded_assets"
+    assert {"questions", "analyses", "uploaded_assets"} <= schema(existing)
 
     run_alembic(existing, "downgrade", "0001_initial")
     assert version(existing) == "0001_initial"
-    assert not {"questions", "analyses"} & schema(existing)
+    assert not {"questions", "analyses", "uploaded_assets"} & schema(existing)
     assert {"users", "user_settings"} <= schema(existing)
