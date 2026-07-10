@@ -15,6 +15,7 @@ from app.models.analysis import Analysis
 from app.models.base import Base
 from app.models.review import UserSettings  # noqa: F401
 from app.models.user import User  # noqa: F401
+from app.services.providers.demo import DemoProvider
 
 
 @pytest.fixture
@@ -280,6 +281,7 @@ def test_manual_analysis_persists_structured_result(client):
     assert analysis["correct_approach"]
     detail = client.get(f"/api/v1/questions/{question['id']}", cookies=cookies)
     assert detail.json()["analysis_status"] == "已完成"
+    assert detail.json()["analysis_error_code"] is None
     assert detail.json()["current_analysis"]["id"] == analysis["id"]
 
 
@@ -299,6 +301,7 @@ def test_reanalysis_keeps_history_and_updates_current_analysis(client):
     assert second.status_code == 200
     assert first.json()["id"] != second.json()["id"]
     assert detail.json()["current_analysis"]["id"] == second.json()["id"]
+    assert detail.json()["analysis_error_code"] is None
 
     async def history_count() -> int:
         async with client.app.state.session_factory() as session:
@@ -346,7 +349,64 @@ def test_analysis_failure_marks_question_failed_without_provider_detail(
     assert response.json()["code"] == "provider_api_error"
     assert "supplier detail" not in response.json()["message"]
     assert detail.json()["analysis_status"] == "失败"
+    assert detail.json()["analysis_error_code"] == "provider_api_error"
     assert detail.json()["current_analysis"] is None
+
+
+def test_successful_reanalysis_clears_prior_failure_code(client, monkeypatch):
+    cookies = register(client, "analysis-recovery@example.com")
+    question = create_question(client, cookies)
+
+    class FailingProvider:
+        async def analyze(self, payload, request_id=None):
+            del payload, request_id
+            raise APIError(504, "provider_timeout", "supplier detail")
+
+    monkeypatch.setattr(
+        "app.api.routes.questions.get_provider", lambda settings: FailingProvider()
+    )
+    failed = client.post(
+        f"/api/v1/questions/{question['id']}/analyze", cookies=cookies
+    )
+    assert failed.status_code == 504
+    assert client.get(f"/api/v1/questions/{question['id']}", cookies=cookies).json()[
+        "analysis_error_code"
+    ] == "provider_timeout"
+
+    monkeypatch.setattr(
+        "app.api.routes.questions.get_provider", lambda settings: DemoProvider()
+    )
+    recovered = client.post(
+        f"/api/v1/questions/{question['id']}/analyze", cookies=cookies
+    )
+    detail = client.get(f"/api/v1/questions/{question['id']}", cookies=cookies)
+
+    assert recovered.status_code == 200
+    assert detail.json()["analysis_status"] == "已完成"
+    assert detail.json()["analysis_error_code"] is None
+
+
+def test_invalid_analysis_result_marks_question_failed_and_returns_stable_code(
+    client, monkeypatch
+):
+    cookies = register(client, "analysis-invalid-result@example.com")
+    question = create_question(client, cookies)
+
+    class InvalidResultProvider:
+        async def analyze(self, payload, request_id=None):
+            del payload, request_id
+            return object()
+
+    monkeypatch.setattr(
+        "app.api.routes.questions.get_provider", lambda settings: InvalidResultProvider()
+    )
+    response = client.post(f"/api/v1/questions/{question['id']}/analyze", cookies=cookies)
+    detail = client.get(f"/api/v1/questions/{question['id']}", cookies=cookies)
+
+    assert response.status_code == 502
+    assert response.json()["code"] == "provider_invalid_response"
+    assert detail.json()["analysis_status"] == "失败"
+    assert detail.json()["analysis_error_code"] == "provider_invalid_response"
 
 
 def test_analysis_uses_per_user_provider_rate_limit(client):

@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
@@ -12,7 +12,7 @@ from app.core.database import get_session
 from app.core.errors import APIError, request_id_for
 from app.models.analysis import Analysis
 from app.models.question import Question
-from app.schemas.analysis import AnalysisInput
+from app.schemas.analysis import AnalysisInput, AnalysisResult
 from app.schemas.common import BulkIds
 from app.schemas.question import (
     AnalysisStatus,
@@ -208,8 +208,27 @@ _ANALYSIS_ERROR_MESSAGES = {
 def _safe_analysis_provider_error(exc: APIError) -> APIError:
     message = _ANALYSIS_ERROR_MESSAGES.get(exc.code)
     if message is None:
-        return APIError(502, "provider_api_error", _ANALYSIS_ERROR_MESSAGES["provider_api_error"])
+        return APIError(
+            502, "provider_api_error", _ANALYSIS_ERROR_MESSAGES["provider_api_error"]
+        )
     return APIError(exc.status_code, exc.code, message)
+
+
+async def _persist_analysis_failure(
+    *, session: AsyncSession, question_id: str, user_id: str, code: str
+) -> None:
+    """Discard partial analysis work, then persist only the public failure state."""
+
+    await session.rollback()
+    await session.execute(
+        update(Question)
+        .where(Question.id == question_id, Question.user_id == user_id)
+        .values(
+            analysis_status=AnalysisStatus.FAILED.value,
+            analysis_error_code=code,
+        )
+    )
+    await session.commit()
 
 
 @router.post("/{question_id}/analyze", response_model=AnalysisRead)
@@ -224,43 +243,61 @@ async def analyze_question(
         raise APIError(429, "provider_rate_limited", "AI 分析请求过于频繁，请稍后再试")
 
     question.analysis_status = AnalysisStatus.ANALYZING.value
+    question.analysis_error_code = None
     await session.commit()
 
-    payload = AnalysisInput(
-        stem=question.stem,
-        options=question.options,
-        user_answer=question.user_answer,
-        correct_answer=question.correct_answer,
-        original_explanation=question.original_explanation or "",
-        ocr_raw_text=question.ocr_raw_text or "",
-        module=ExamModule(question.module),
-    )
     try:
-        result = await get_provider(request.app.state.settings).analyze(
+        payload = AnalysisInput(
+            stem=question.stem,
+            options=question.options,
+            user_answer=question.user_answer,
+            correct_answer=question.correct_answer,
+            original_explanation=question.original_explanation or "",
+            ocr_raw_text=question.ocr_raw_text or "",
+            module=ExamModule(question.module),
+        )
+        provider_result = await get_provider(request.app.state.settings).analyze(
             payload, request_id=request_id_for(request)
         )
-    except APIError as exc:
-        question.analysis_status = AnalysisStatus.FAILED.value
-        await session.commit()
-        raise _safe_analysis_provider_error(exc) from exc
-    except Exception as exc:
-        question.analysis_status = AnalysisStatus.FAILED.value
-        await session.commit()
-        raise APIError(
-            502, "provider_api_error", _ANALYSIS_ERROR_MESSAGES["provider_api_error"]
-        ) from exc
+        try:
+            result = AnalysisResult.model_validate(provider_result)
+        except (TypeError, ValueError) as exc:
+            raise APIError(
+                502, "provider_invalid_response", _ANALYSIS_ERROR_MESSAGES["provider_invalid_response"]
+            ) from exc
 
-    analysis = Analysis(
-        question_id=question.id,
-        user_id=current_user.id,
-        **result.model_dump(mode="json"),
-    )
-    session.add(analysis)
-    await session.flush()
-    question.current_analysis_id = analysis.id
-    question.knowledge_points = result.knowledge_points
-    question.error_reason = result.suggested_error_reason.value
-    question.analysis_status = AnalysisStatus.COMPLETED.value
-    await session.commit()
-    await session.refresh(analysis)
-    return analysis
+        analysis = Analysis(
+            question_id=question.id,
+            user_id=current_user.id,
+            **result.model_dump(mode="json"),
+        )
+        session.add(analysis)
+        await session.flush()
+        await session.refresh(analysis)
+        question.current_analysis_id = analysis.id
+        question.knowledge_points = result.knowledge_points
+        question.error_reason = result.suggested_error_reason.value
+        question.analysis_status = AnalysisStatus.COMPLETED.value
+        question.analysis_error_code = None
+        await session.commit()
+        return analysis
+    except APIError as exc:
+        public_error = _safe_analysis_provider_error(exc)
+        await _persist_analysis_failure(
+            session=session,
+            question_id=question.id,
+            user_id=current_user.id,
+            code=public_error.code,
+        )
+        raise public_error from exc
+    except Exception as exc:
+        code = "provider_api_error"
+        await _persist_analysis_failure(
+            session=session,
+            question_id=question.id,
+            user_id=current_user.id,
+            code=code,
+        )
+        raise APIError(
+            502, code, _ANALYSIS_ERROR_MESSAGES[code]
+        ) from exc

@@ -49,6 +49,7 @@ class Question(TimestampMixin, Base):
     analysis_status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="未分析", server_default="未分析"
     )
+    analysis_error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
     tags: Mapped[list[str]] = mapped_column(
         JSON, nullable=False, default=list, server_default="[]"
     )

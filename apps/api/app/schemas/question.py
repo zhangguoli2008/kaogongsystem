@@ -133,6 +133,7 @@ class QuestionRead(QuestionCreate):
     user_id: str
     current_analysis_id: str | None = None
     current_analysis: AnalysisRead | None = None
+    analysis_error_code: str | None = None
     created_at: datetime
     updated_at: datetime
 

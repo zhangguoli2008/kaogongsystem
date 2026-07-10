@@ -62,6 +62,39 @@ def test_demo_provider_returns_deterministic_structured_analysis():
     assert first.correct_approach
 
 
+def test_demo_provider_analysis_uses_answers_and_explanation_without_echoing_them():
+    incorrect = asyncio.run(DemoProvider().analyze(analysis_input()))
+    matching_user_answer = asyncio.run(
+        DemoProvider().analyze(analysis_input().model_copy(update={"user_answer": "B"}))
+    )
+    correct = asyncio.run(
+        DemoProvider().analyze(analysis_input().model_copy(update={"correct_answer": "A"}))
+    )
+    missing_explanation = asyncio.run(
+        DemoProvider().analyze(
+            analysis_input().model_copy(update={"original_explanation": ""})
+        )
+    )
+
+    assert incorrect.cause_analysis != matching_user_answer.cause_analysis
+    assert incorrect.cause_analysis != correct.cause_analysis
+    assert incorrect.correct_approach != missing_explanation.correct_approach
+    assert set(incorrect.raw_response) == {
+        "cause_analysis",
+        "knowledge_points",
+        "correct_approach",
+        "study_advice",
+        "suggested_error_reason",
+    }
+    assert incorrect.raw_response == {
+        "cause_analysis": incorrect.cause_analysis,
+        "knowledge_points": incorrect.knowledge_points,
+        "correct_approach": incorrect.correct_approach,
+        "study_advice": incorrect.study_advice,
+        "suggested_error_reason": incorrect.suggested_error_reason.value,
+    }
+
+
 def test_analysis_schemas_forbid_extra_top_level_fields():
     assert AnalysisInput.model_json_schema()["additionalProperties"] is False
     assert AnalysisResult.model_json_schema()["additionalProperties"] is False
