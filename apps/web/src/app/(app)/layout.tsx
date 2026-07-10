@@ -5,6 +5,7 @@ import { useState, type ReactNode } from "react";
 import { AppHeader } from "@/components/layout/app-header";
 import { Sidebar } from "@/components/layout/sidebar";
 import { useSession } from "@/hooks/use-session";
+import { ApiError } from "@/lib/api";
 
 export function AppShell({ children }: { children: ReactNode }) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -12,6 +13,10 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   if (session.isPending) {
     return <div className="grid min-h-screen place-items-center bg-[#F7F8FC] text-sm text-[#6A7893]">正在加载学习空间…</div>;
+  }
+
+  if (session.error instanceof ApiError && session.error.status === 401) {
+    return <div className="grid min-h-screen place-items-center bg-[#F7F8FC] text-sm text-[#6A7893]" role="status">正在返回登录页…</div>;
   }
 
   if (!session.data) {

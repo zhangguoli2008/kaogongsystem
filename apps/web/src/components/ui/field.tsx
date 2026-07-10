@@ -23,6 +23,8 @@ export function Field({ label, htmlFor, error, hint, children }: FieldProps) {
         <p
           className={cn("text-xs leading-5", error ? "text-[#D84755]" : "text-[#6A7893]")}
           id={error ? `${htmlFor}-error` : undefined}
+          role={error ? "alert" : undefined}
+          aria-live={error ? "assertive" : undefined}
         >
           {message}
         </p>

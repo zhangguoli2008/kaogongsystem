@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useEffect, useRef, type KeyboardEvent } from "react";
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/cn";
@@ -34,6 +35,12 @@ export const navigationItems: NavigationItem[] = [
 interface SidebarProps {
   open: boolean;
   onClose: () => void;
+}
+
+function focusableElements(container: HTMLElement) {
+  return Array.from(
+    container.querySelectorAll<HTMLElement>("a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])"),
+  );
 }
 
 function SidebarContent({ onClose }: Pick<SidebarProps, "onClose">) {
@@ -75,6 +82,48 @@ function SidebarContent({ onClose }: Pick<SidebarProps, "onClose">) {
 }
 
 export function Sidebar({ open, onClose }: SidebarProps) {
+  const drawerRef = useRef<HTMLElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    closeButtonRef.current?.focus();
+
+    return () => previouslyFocused?.focus();
+  }, [open]);
+
+  function handleDrawerKeyDown(event: KeyboardEvent<HTMLElement>) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      onClose();
+      return;
+    }
+
+    if (event.key !== "Tab" || !drawerRef.current) {
+      return;
+    }
+
+    const focusable = focusableElements(drawerRef.current);
+    const first = focusable.at(0);
+    const last = focusable.at(-1);
+
+    if (!first || !last) {
+      return;
+    }
+
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
   return (
     <>
       <aside className="fixed inset-y-0 left-0 z-30 hidden w-60 flex-col border-r border-[#E4E8F2] bg-white lg:flex">
@@ -86,11 +135,19 @@ export function Sidebar({ open, onClose }: SidebarProps) {
           <button
             type="button"
             aria-label="关闭导航"
-            className="absolute inset-0 bg-[#0D1B4C]/35"
+            className="absolute inset-0 bg-[#0D1B4C]/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-white"
             onClick={onClose}
           />
-          <aside className="relative flex h-full w-60 flex-col bg-white shadow-xl">
+          <aside
+            ref={drawerRef}
+            role="dialog"
+            aria-modal="true"
+            aria-label="主导航"
+            className="relative flex h-full w-60 flex-col bg-white shadow-xl"
+            onKeyDown={handleDrawerKeyDown}
+          >
             <Button
+              ref={closeButtonRef}
               variant="ghost"
               size="icon"
               className="absolute right-3 top-5 z-10"

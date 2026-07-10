@@ -1,7 +1,7 @@
 "use client";
 
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { BrainCircuit, LogIn } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -12,12 +12,19 @@ import { Button } from "@/components/ui/button";
 import { Field } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { useSession } from "@/hooks/use-session";
-import { ApiError, apiFetch } from "@/lib/api";
+import { applyApiFormErrors } from "@/lib/form-errors";
+import { apiFetch } from "@/lib/api";
+import { resolveReturnTo } from "@/lib/return-to";
 import { loginSchema, type LoginValues } from "@/lib/schemas";
 import type { User } from "@/types/api";
 
+function currentReturnTo() {
+  return resolveReturnTo(new URLSearchParams(window.location.search).get("returnTo"));
+}
+
 export default function LoginPage() {
   const router = useRouter();
+  const queryClient = useQueryClient();
   const session = useSession({ redirectOnUnauthorized: false });
   const {
     register,
@@ -31,7 +38,7 @@ export default function LoginPage() {
 
   useEffect(() => {
     if (session.data) {
-      router.replace("/dashboard");
+      router.replace(currentReturnTo());
     }
   }, [router, session.data]);
 
@@ -41,10 +48,12 @@ export default function LoginPage() {
         method: "POST",
         body: JSON.stringify(values),
       }),
-    onSuccess: () => router.replace("/dashboard"),
+    onSuccess: (user) => {
+      queryClient.setQueryData(["session"], user);
+      router.replace(currentReturnTo());
+    },
     onError: (error) => {
-      const message = error instanceof ApiError ? error.body.message : "网络连接失败，请稍后重试";
-      setError("root", { message });
+      applyApiFormErrors(error, setError, ["email", "password"]);
     },
   });
 
@@ -66,10 +75,10 @@ export default function LoginPage() {
         </div>
         <form className="mt-9 space-y-5" noValidate onSubmit={handleSubmit((values) => login.mutate(values))}>
           <Field label="邮箱" htmlFor="email" error={errors.email?.message}>
-            <Input id="email" type="email" autoComplete="email" aria-invalid={Boolean(errors.email)} {...register("email")} />
+            <Input id="email" type="email" autoComplete="email" aria-invalid={Boolean(errors.email)} aria-describedby={errors.email ? "email-error" : undefined} {...register("email")} />
           </Field>
           <Field label="密码" htmlFor="password" error={errors.password?.message}>
-            <Input id="password" type="password" autoComplete="current-password" aria-invalid={Boolean(errors.password)} {...register("password")} />
+            <Input id="password" type="password" autoComplete="current-password" aria-invalid={Boolean(errors.password)} aria-describedby={errors.password ? "password-error" : undefined} {...register("password")} />
           </Field>
           {errors.root?.message ? <p className="text-sm text-[#D84755]" role="alert">{errors.root.message}</p> : null}
           <Button className="w-full" type="submit" disabled={login.isPending}>

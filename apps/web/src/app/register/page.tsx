@@ -1,7 +1,7 @@
 "use client";
 
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { BrainCircuit, UserPlus } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -12,12 +12,19 @@ import { Button } from "@/components/ui/button";
 import { Field } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { useSession } from "@/hooks/use-session";
-import { ApiError, apiFetch } from "@/lib/api";
+import { apiFetch } from "@/lib/api";
+import { applyApiFormErrors } from "@/lib/form-errors";
+import { resolveReturnTo } from "@/lib/return-to";
 import { registerSchema, type RegisterValues } from "@/lib/schemas";
 import type { User } from "@/types/api";
 
+function currentReturnTo() {
+  return resolveReturnTo(new URLSearchParams(window.location.search).get("returnTo"));
+}
+
 export default function RegisterPage() {
   const router = useRouter();
+  const queryClient = useQueryClient();
   const session = useSession({ redirectOnUnauthorized: false });
   const {
     register,
@@ -31,7 +38,7 @@ export default function RegisterPage() {
 
   useEffect(() => {
     if (session.data) {
-      router.replace("/dashboard");
+      router.replace(currentReturnTo());
     }
   }, [router, session.data]);
 
@@ -41,10 +48,12 @@ export default function RegisterPage() {
         method: "POST",
         body: JSON.stringify({ email: values.email, password: values.password }),
       }),
-    onSuccess: () => router.replace("/dashboard"),
+    onSuccess: (user) => {
+      queryClient.setQueryData(["session"], user);
+      router.replace(currentReturnTo());
+    },
     onError: (error) => {
-      const message = error instanceof ApiError ? error.body.message : "网络连接失败，请稍后重试";
-      setError("root", { message });
+      applyApiFormErrors(error, setError, ["email", "password", "confirmPassword"]);
     },
   });
 
@@ -66,13 +75,13 @@ export default function RegisterPage() {
         </div>
         <form className="mt-8 space-y-4" noValidate onSubmit={handleSubmit((values) => registerUser.mutate(values))}>
           <Field label="邮箱" htmlFor="email" error={errors.email?.message}>
-            <Input id="email" type="email" autoComplete="email" aria-invalid={Boolean(errors.email)} {...register("email")} />
+            <Input id="email" type="email" autoComplete="email" aria-invalid={Boolean(errors.email)} aria-describedby={errors.email ? "email-error" : undefined} {...register("email")} />
           </Field>
           <Field label="密码" htmlFor="password" hint="至少 8 位字符" error={errors.password?.message}>
-            <Input id="password" type="password" autoComplete="new-password" aria-invalid={Boolean(errors.password)} {...register("password")} />
+            <Input id="password" type="password" autoComplete="new-password" aria-invalid={Boolean(errors.password)} aria-describedby={errors.password ? "password-error" : undefined} {...register("password")} />
           </Field>
           <Field label="确认密码" htmlFor="confirmPassword" error={errors.confirmPassword?.message}>
-            <Input id="confirmPassword" type="password" autoComplete="new-password" aria-invalid={Boolean(errors.confirmPassword)} {...register("confirmPassword")} />
+            <Input id="confirmPassword" type="password" autoComplete="new-password" aria-invalid={Boolean(errors.confirmPassword)} aria-describedby={errors.confirmPassword ? "confirmPassword-error" : undefined} {...register("confirmPassword")} />
           </Field>
           {errors.root?.message ? <p className="text-sm text-[#D84755]" role="alert">{errors.root.message}</p> : null}
           <Button className="mt-2 w-full" type="submit" disabled={registerUser.isPending}>
