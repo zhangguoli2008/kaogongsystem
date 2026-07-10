@@ -72,6 +72,10 @@ def create_question(client, cookies, **overrides):
     return response.json()
 
 
+def test_question_and_analysis_tables_register_with_api_router():
+    assert {"questions", "analyses"}.issubset(Base.metadata.tables)
+
+
 def test_question_crud_has_defaults_and_updates(client):
     cookies = register(client, "crud@example.com")
     created = create_question(client, cookies)
@@ -98,6 +102,38 @@ def test_question_crud_has_defaults_and_updates(client):
     deleted = client.delete(f"/api/v1/questions/{question_id}", cookies=cookies)
     assert deleted.status_code == 204
     assert client.get(f"/api/v1/questions/{question_id}", cookies=cookies).status_code == 404
+
+
+@pytest.mark.parametrize("field", ["stem", "module"])
+def test_question_update_rejects_null_for_required_fields(client, field):
+    cookies = register(client, f"null-{field}@example.com")
+    created = create_question(client, cookies)
+
+    response = client.patch(
+        f"/api/v1/questions/{created['id']}",
+        cookies=cookies,
+        json={field: None},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "validation_error"
+    assert client.get(
+        f"/api/v1/questions/{created['id']}", cookies=cookies
+    ).json()[field] == created[field]
+
+
+def test_question_update_allows_null_for_nullable_fields(client):
+    cookies = register(client, "nullable@example.com")
+    created = create_question(client, cookies, notes="临时笔记")
+
+    response = client.patch(
+        f"/api/v1/questions/{created['id']}",
+        cookies=cookies,
+        json={"notes": None},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["notes"] is None
 
 
 def test_question_is_isolated_by_user(client):

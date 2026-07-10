@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import Enum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.common import Pagination
 
@@ -85,6 +85,25 @@ class QuestionUpdate(BaseModel):
     mastery_status: MasteryStatus | None = None
     analysis_status: AnalysisStatus | None = None
     tags: list[str] | None = Field(default=None, max_length=100)
+
+    @field_validator(
+        "exam_type",
+        "module",
+        "stem",
+        "options",
+        "user_answer",
+        "correct_answer",
+        "knowledge_points",
+        "mastery_status",
+        "analysis_status",
+        "tags",
+        mode="before",
+    )
+    @classmethod
+    def reject_null_for_required_fields(cls, value):
+        if value is None:
+            raise ValueError("Field cannot be null")
+        return value
 
 
 class QuestionRead(QuestionCreate):
