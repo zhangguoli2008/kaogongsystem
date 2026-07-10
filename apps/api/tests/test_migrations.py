@@ -47,13 +47,14 @@ def test_wrong_question_migration_supports_fresh_existing_and_downgrade(tmp_path
     fresh = tmp_path / "fresh.db"
     run_alembic(fresh, "upgrade", "head")
     run_alembic(fresh, "check")
-    assert version(fresh) == "0004_analysis_error_code"
+    assert version(fresh) == "0005_review_records"
     assert {
         "users",
         "user_settings",
         "questions",
         "analyses",
         "uploaded_assets",
+        "review_records",
     } <= schema(fresh)
     assert "analysis_error_code" in columns(fresh, "questions")
 
@@ -64,10 +65,16 @@ def test_wrong_question_migration_supports_fresh_existing_and_downgrade(tmp_path
 
     run_alembic(existing, "upgrade", "head")
     run_alembic(existing, "check")
-    assert version(existing) == "0004_analysis_error_code"
-    assert {"questions", "analyses", "uploaded_assets"} <= schema(existing)
+    assert version(existing) == "0005_review_records"
+    assert {"questions", "analyses", "uploaded_assets", "review_records"} <= schema(existing)
     assert "analysis_error_code" in columns(existing, "questions")
+    assert {"result_status", "review_note", "reviewed_at"} <= columns(
+        existing, "review_records"
+    )
 
+    run_alembic(existing, "downgrade", "0004_analysis_error_code")
+    assert version(existing) == "0004_analysis_error_code"
+    assert "review_records" not in schema(existing)
     run_alembic(existing, "downgrade", "0003_uploaded_assets")
     assert version(existing) == "0003_uploaded_assets"
     assert "analysis_error_code" not in columns(existing, "questions")
