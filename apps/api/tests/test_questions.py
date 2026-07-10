@@ -5,10 +5,13 @@ import asyncio
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.api.routes.questions import router as questions_router
+from app.core.errors import APIError
 from app.main import create_app
+from app.models.analysis import Analysis
 from app.models.base import Base
 from app.models.review import UserSettings  # noqa: F401
 from app.models.user import User  # noqa: F401
@@ -261,6 +264,103 @@ def test_question_requests_require_auth_and_validate_bulk_limit(client):
     )
     assert response.status_code == 422
     assert response.json()["code"] == "validation_error"
+
+
+def test_manual_analysis_persists_structured_result(client):
+    cookies = register(client, "analysis@example.com")
+    question = create_question(client, cookies)
+
+    response = client.post(f"/api/v1/questions/{question['id']}/analyze", cookies=cookies)
+
+    assert response.status_code == 200
+    analysis = response.json()
+    assert analysis["is_demo"] is True
+    assert analysis["cause_analysis"]
+    assert analysis["knowledge_points"]
+    assert analysis["correct_approach"]
+    detail = client.get(f"/api/v1/questions/{question['id']}", cookies=cookies)
+    assert detail.json()["analysis_status"] == "已完成"
+    assert detail.json()["current_analysis"]["id"] == analysis["id"]
+
+
+def test_reanalysis_keeps_history_and_updates_current_analysis(client):
+    cookies = register(client, "reanalysis@example.com")
+    question = create_question(client, cookies)
+
+    first = client.post(
+        f"/api/v1/questions/{question['id']}/analyze", cookies=cookies
+    )
+    second = client.post(
+        f"/api/v1/questions/{question['id']}/analyze", cookies=cookies
+    )
+    detail = client.get(f"/api/v1/questions/{question['id']}", cookies=cookies)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["id"] != second.json()["id"]
+    assert detail.json()["current_analysis"]["id"] == second.json()["id"]
+
+    async def history_count() -> int:
+        async with client.app.state.session_factory() as session:
+            count = await session.scalar(
+                select(func.count())
+                .select_from(Analysis)
+                .where(Analysis.question_id == question["id"])
+            )
+        return count or 0
+
+    assert asyncio.run(history_count()) == 2
+
+
+def test_question_analysis_is_isolated_by_user(client):
+    owner = register(client, "analysis-owner@example.com")
+    question = create_question(client, owner)
+    other = register(client, "analysis-other@example.com")
+
+    response = client.post(
+        f"/api/v1/questions/{question['id']}/analyze", cookies=other
+    )
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "not_found"
+
+
+def test_analysis_failure_marks_question_failed_without_provider_detail(
+    client, monkeypatch
+):
+    cookies = register(client, "analysis-failure@example.com")
+    question = create_question(client, cookies)
+
+    class FailingProvider:
+        async def analyze(self, payload, request_id=None):
+            del payload, request_id
+            raise APIError(502, "provider_api_error", "supplier detail: secret")
+
+    monkeypatch.setattr(
+        "app.api.routes.questions.get_provider", lambda settings: FailingProvider()
+    )
+    response = client.post(f"/api/v1/questions/{question['id']}/analyze", cookies=cookies)
+    detail = client.get(f"/api/v1/questions/{question['id']}", cookies=cookies)
+
+    assert response.status_code == 502
+    assert response.json()["code"] == "provider_api_error"
+    assert "supplier detail" not in response.json()["message"]
+    assert detail.json()["analysis_status"] == "失败"
+    assert detail.json()["current_analysis"] is None
+
+
+def test_analysis_uses_per_user_provider_rate_limit(client):
+    cookies = register(client, "analysis-rate-limit@example.com")
+    question = create_question(client, cookies)
+
+    responses = [
+        client.post(f"/api/v1/questions/{question['id']}/analyze", cookies=cookies)
+        for _ in range(11)
+    ]
+
+    assert [response.status_code for response in responses[:10]] == [200] * 10
+    assert responses[10].status_code == 429
+    assert responses[10].json()["code"] == "provider_rate_limited"
 
 
 def test_bulk_routes_are_registered_before_id_route(client):

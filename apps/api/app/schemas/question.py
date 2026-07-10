@@ -108,12 +108,31 @@ class QuestionUpdate(BaseModel):
         return value
 
 
+class AnalysisRead(BaseModel):
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+
+    id: str
+    question_id: str
+    user_id: str
+    cause_analysis: str
+    knowledge_points: list[str]
+    correct_approach: str
+    study_advice: str
+    suggested_error_reason: ErrorReason | None
+    raw_response: dict[str, object]
+    provider_name: str
+    model_name: str | None
+    is_demo: bool
+    created_at: datetime
+
+
 class QuestionRead(QuestionCreate):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
     user_id: str
     current_analysis_id: str | None = None
+    current_analysis: AnalysisRead | None = None
     created_at: datetime
     updated_at: datetime
 

@@ -3,14 +3,16 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Response, status
+from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
 from app.core.database import get_session
-from app.core.errors import APIError
+from app.core.errors import APIError, request_id_for
+from app.models.analysis import Analysis
 from app.models.question import Question
+from app.schemas.analysis import AnalysisInput
 from app.schemas.common import BulkIds
 from app.schemas.question import (
     AnalysisStatus,
@@ -19,10 +21,12 @@ from app.schemas.question import (
     ExamModule,
     MasteryStatus,
     QuestionCreate,
+    AnalysisRead,
     QuestionPage,
     QuestionRead,
     QuestionUpdate,
 )
+from app.services.providers.factory import get_provider
 
 router = APIRouter(prefix="/questions", tags=["questions"])
 Session = Annotated[AsyncSession, Depends(get_session)]
@@ -190,3 +194,73 @@ async def delete_question(
     await session.delete(question)
     await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+_ANALYSIS_ERROR_MESSAGES = {
+    "provider_timeout": "AI 分析服务响应超时",
+    "provider_connection_error": "AI 分析服务连接失败",
+    "provider_rate_limited": "AI 分析服务请求过于频繁",
+    "provider_invalid_response": "AI 分析服务返回内容无效",
+    "provider_api_error": "AI 分析服务暂时不可用",
+}
+
+
+def _safe_analysis_provider_error(exc: APIError) -> APIError:
+    message = _ANALYSIS_ERROR_MESSAGES.get(exc.code)
+    if message is None:
+        return APIError(502, "provider_api_error", _ANALYSIS_ERROR_MESSAGES["provider_api_error"])
+    return APIError(exc.status_code, exc.code, message)
+
+
+@router.post("/{question_id}/analyze", response_model=AnalysisRead)
+async def analyze_question(
+    question_id: str,
+    current_user: CurrentUser,
+    session: Session,
+    request: Request,
+) -> Analysis:
+    question = await _get_owned_question(question_id, current_user.id, session)
+    if not request.app.state.provider_rate_limiter.allow(current_user.id):
+        raise APIError(429, "provider_rate_limited", "AI 分析请求过于频繁，请稍后再试")
+
+    question.analysis_status = AnalysisStatus.ANALYZING.value
+    await session.commit()
+
+    payload = AnalysisInput(
+        stem=question.stem,
+        options=question.options,
+        user_answer=question.user_answer,
+        correct_answer=question.correct_answer,
+        original_explanation=question.original_explanation or "",
+        ocr_raw_text=question.ocr_raw_text or "",
+        module=ExamModule(question.module),
+    )
+    try:
+        result = await get_provider(request.app.state.settings).analyze(
+            payload, request_id=request_id_for(request)
+        )
+    except APIError as exc:
+        question.analysis_status = AnalysisStatus.FAILED.value
+        await session.commit()
+        raise _safe_analysis_provider_error(exc) from exc
+    except Exception as exc:
+        question.analysis_status = AnalysisStatus.FAILED.value
+        await session.commit()
+        raise APIError(
+            502, "provider_api_error", _ANALYSIS_ERROR_MESSAGES["provider_api_error"]
+        ) from exc
+
+    analysis = Analysis(
+        question_id=question.id,
+        user_id=current_user.id,
+        **result.model_dump(mode="json"),
+    )
+    session.add(analysis)
+    await session.flush()
+    question.current_analysis_id = analysis.id
+    question.knowledge_points = result.knowledge_points
+    question.error_reason = result.suggested_error_reason.value
+    question.analysis_status = AnalysisStatus.COMPLETED.value
+    await session.commit()
+    await session.refresh(analysis)
+    return analysis

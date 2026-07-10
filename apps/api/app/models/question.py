@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from sqlalchemy import JSON, ForeignKey, Index, String, Text
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import JSON, ForeignKey, Index, String, Text, and_
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
+
+if TYPE_CHECKING:
+    from app.models.analysis import Analysis
 
 
 class Question(TimestampMixin, Base):
@@ -50,4 +54,21 @@ class Question(TimestampMixin, Base):
     )
     current_analysis_id: Mapped[str | None] = mapped_column(
         String(36), nullable=True, index=True
+    )
+    analyses: Mapped[list[Analysis]] = relationship(
+        "Analysis",
+        back_populates="question",
+        foreign_keys="Analysis.question_id",
+        passive_deletes=True,
+    )
+    current_analysis: Mapped[Analysis | None] = relationship(
+        "Analysis",
+        primaryjoin=(
+            "and_(foreign(Question.current_analysis_id) == Analysis.id, "
+            "Question.user_id == Analysis.user_id)"
+        ),
+        foreign_keys="Question.current_analysis_id",
+        uselist=False,
+        viewonly=True,
+        lazy="selectin",
     )

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Protocol
 
+from app.schemas.analysis import AnalysisInput, AnalysisResult
 from app.schemas.upload import OcrResult
 
 
@@ -13,4 +14,6 @@ class AIProvider(Protocol):
         request_id: str | None = None,
     ) -> OcrResult: ...
 
-    async def analyze(self, payload: Any) -> Any: ...
+    async def analyze(
+        self, payload: AnalysisInput, request_id: str | None = None
+    ) -> AnalysisResult: ...
