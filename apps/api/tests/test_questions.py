@@ -15,6 +15,7 @@ from app.models.analysis import Analysis
 from app.models.base import Base
 from app.models.review import UserSettings  # noqa: F401
 from app.models.user import User  # noqa: F401
+from app.schemas.analysis import AnalysisResult
 from app.services.providers.demo import DemoProvider
 
 
@@ -399,6 +400,39 @@ def test_invalid_analysis_result_marks_question_failed_and_returns_stable_code(
 
     monkeypatch.setattr(
         "app.api.routes.questions.get_provider", lambda settings: InvalidResultProvider()
+    )
+    response = client.post(f"/api/v1/questions/{question['id']}/analyze", cookies=cookies)
+    detail = client.get(f"/api/v1/questions/{question['id']}", cookies=cookies)
+
+    assert response.status_code == 502
+    assert response.json()["code"] == "provider_invalid_response"
+    assert detail.json()["analysis_status"] == "失败"
+    assert detail.json()["analysis_error_code"] == "provider_invalid_response"
+
+
+def test_mutated_analysis_result_is_revalidated_before_persistence(client, monkeypatch):
+    cookies = register(client, "analysis-mutated-result@example.com")
+    question = create_question(client, cookies)
+
+    class MutatedResultProvider:
+        async def analyze(self, payload, request_id=None):
+            del payload, request_id
+            result = AnalysisResult(
+                cause_analysis="原因",
+                knowledge_points=["知识点"],
+                correct_approach="思路",
+                study_advice="建议",
+                suggested_error_reason="计算错",
+                raw_response={},
+                provider_name="test",
+                model_name="test",
+                is_demo=False,
+            )
+            result.suggested_error_reason = "bad"
+            return result
+
+    monkeypatch.setattr(
+        "app.api.routes.questions.get_provider", lambda settings: MutatedResultProvider()
     )
     response = client.post(f"/api/v1/questions/{question['id']}/analyze", cookies=cookies)
     detail = client.get(f"/api/v1/questions/{question['id']}", cookies=cookies)

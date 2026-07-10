@@ -259,8 +259,16 @@ async def analyze_question(
         provider_result = await get_provider(request.app.state.settings).analyze(
             payload, request_id=request_id_for(request)
         )
+        if not isinstance(provider_result, AnalysisResult):
+            raise APIError(
+                502,
+                "provider_invalid_response",
+                _ANALYSIS_ERROR_MESSAGES["provider_invalid_response"],
+            )
         try:
-            result = AnalysisResult.model_validate(provider_result)
+            result = AnalysisResult.model_validate(
+                provider_result.model_dump(mode="json", warnings="error")
+            )
         except (TypeError, ValueError) as exc:
             raise APIError(
                 502, "provider_invalid_response", _ANALYSIS_ERROR_MESSAGES["provider_invalid_response"]
