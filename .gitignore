@@ -19,3 +19,4 @@ venv/
 target/
 out/
 *.class
+.worktrees/
