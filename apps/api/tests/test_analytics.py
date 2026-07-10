@@ -2,8 +2,10 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import update
+from sqlalchemy.dialects import postgresql
 
 from app.models.question import Question
+from app.services.analytics import trend_for_days
 
 
 def question_payload(**overrides):
@@ -53,6 +55,36 @@ def set_question_created_at(client, question_id: str, created_at: datetime) -> N
 
 def values_by_label(items):
     return {item["label"]: item["count"] for item in items}
+
+
+def test_trend_for_days_compiles_a_utc_date_bucket_for_postgresql():
+    statements = []
+
+    class PostgresSession:
+        def get_bind(self):
+            return type("Bind", (), {"dialect": postgresql.dialect()})()
+
+        async def execute(self, statement):
+            statements.append(statement)
+            return []
+
+    trends = asyncio.run(
+        trend_for_days(
+            PostgresSession(),
+            "analytics-user",
+            7,
+            now=datetime(2026, 7, 10, 12, tzinfo=timezone.utc),
+        )
+    )
+
+    sql = str(
+        statements[0].compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
+    assert "date(timezone('UTC', questions.created_at))" in sql
+    assert trends[0].date == "2026-07-04"
+    assert trends[-1].date == "2026-07-10"
 
 
 def test_analytics_aggregates_only_current_user_and_fills_trends(client):

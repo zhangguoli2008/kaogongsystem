@@ -125,6 +125,21 @@ def test_today_review_honors_user_limit(client):
     assert len(response.json()["pending"]) == 10
 
 
+def test_today_review_uses_remaining_capacity_after_completed_reviews(client):
+    cookies = register(client, "review-capacity@example.com")
+    questions = [create_question(client, cookies) for _ in range(11)]
+    set_review_limit(client, questions[0]["user_id"], 10)
+    submit_review(client, cookies, questions[0]["id"])
+
+    response = client.get("/api/v1/reviews/today", cookies=cookies)
+
+    assert response.status_code == 200
+    today = response.json()
+    assert len(today["pending"]) == 9
+    assert today["completed_count"] == 1
+    assert today["total"] == 10
+
+
 @pytest.mark.parametrize("limit", [10, 20, 30, 50])
 def test_daily_review_limit_accepts_only_product_options(limit):
     from app.schemas.review import ReviewSettingsUpdate

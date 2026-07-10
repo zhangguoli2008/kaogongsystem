@@ -18,6 +18,14 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _utc_date_bucket(session: AsyncSession):
+    """Return the database date expression for the same UTC day as filters."""
+
+    if session.get_bind().dialect.name == "postgresql":
+        return func.date(func.timezone("UTC", Question.created_at)).label("date")
+    return func.date(Question.created_at).label("date")
+
+
 async def _count_distribution(
     session: AsyncSession,
     user_id: str,
@@ -64,7 +72,7 @@ async def trend_for_days(
     start_date = current.date() - timedelta(days=days - 1)
     start = datetime.combine(start_date, time.min, tzinfo=timezone.utc)
     end = datetime.combine(current.date() + timedelta(days=1), time.min, tzinfo=timezone.utc)
-    date_column = func.date(Question.created_at).label("date")
+    date_column = _utc_date_bucket(session)
     count = func.count().label("count")
     rows = await session.execute(
         select(date_column, count)

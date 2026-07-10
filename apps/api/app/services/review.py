@@ -144,7 +144,11 @@ async def get_today_review(
         ),
         reverse=True,
     )
-    pending = pending[:daily_limit]
+    # Today's completed questions consume the same daily quota.  Without this
+    # remaining-capacity cap, a completed item would be replaced by another
+    # pending item and users could receive more than their configured count.
+    remaining_capacity = max(0, daily_limit - len(completed_question_ids))
+    pending = pending[:remaining_capacity]
     return TodayReviewResponse(
         daily_review_limit=daily_limit,
         pending=pending,
