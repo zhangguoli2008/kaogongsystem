@@ -1,9 +1,10 @@
 # Railway 正式测试环境部署设计规格
 
 - 日期：2026-07-11
-- 状态：方案已获用户批准，待书面规格复核
+- 状态：方案与书面规格均已获用户批准，进入实施
 - 发布方式：Railway CLI 直接上传当前已验证源码
 - AI 模式：确定性演示 Provider
+- 浏览器通信：Web 同源 API 代理
 - 目标分支：`codex/ai-exam-system`
 
 ## 1. 目标与完成定义
@@ -12,7 +13,7 @@
 
 只有同时满足下列条件才算完成：
 
-1. Web、API 与 PostgreSQL 均在 Railway 独立运行，Web 和 API 有可访问的 HTTPS 地址。
+1. Web、API 与 PostgreSQL 均在 Railway 独立运行，Web 和 API 有可访问的 HTTPS 地址；浏览器业务请求只访问 Web 同源 `/api/v1`。
 2. API 使用持久化 PostgreSQL，上传文件写入挂载在 `/data/uploads` 的持久化卷。
 3. API 只运行一个副本，避免本地文件卷与进程内限流在多副本间产生不一致。
 4. 正式环境配置 fail-closed：强 JWT 密钥、Secure Cookie、精确 HTTPS CORS、明确的 `demo` Provider，以及非本地数据库地址。
@@ -27,10 +28,12 @@
 
 ### 2.1 采用：Railway CLI 直传源码
 
-从当前工作区根目录分别向 Web 与 API 服务执行 `railway up`。两个服务都使用仓库根目录作为构建上下文，通过 `RAILWAY_DOCKERFILE_PATH` 分别选择：
+从当前工作区根目录分别向 Web 与 API 服务执行：
 
-- Web：`apps/web/Dockerfile`
-- API：`apps/api/Dockerfile`
+- API：`railway up apps/api --path-as-root --service api`
+- Web：`railway up apps/web --path-as-root --service web`
+
+`--path-as-root` 让每个现有 Dockerfile 继续使用自己的应用目录作为构建上下文，避免改变已经通过本地验证的 `COPY` 边界。每个应用目录内新增独立的 `railway.json`，固定 Dockerfile builder、单副本、健康检查和 API 的迁移/卷要求。
 
 该方式不依赖新增 GitHub 仓库，能发布当前已完成本地 QA 的确切源码状态，也适合本次“一次完整正式环境测试”的目标。
 
@@ -39,13 +42,17 @@
 - GitHub 自动部署：适合长期 CI/CD，但当前 GitHub 连接中没有可用仓库，会增加仓库创建与授权步骤。
 - Docker Compose 画布导入：可以快速生成服务，但部分 Compose 字段无法一一映射，关键安全与迁移配置更难审计。
 - OpenAI Sites：现有应用依赖 FastAPI、PostgreSQL 和 POSIX 上传卷，迁移到 Sites 需要重写后端与存储，不属于本次部署范围。
+- 浏览器直接跨 Railway Web/API 子域调用：`up.railway.app` 是公共后缀，两个服务域名属于不同站点，`SameSite=Lax` 会话 Cookie 不可靠。
+- `SameSite=None`：会依赖第三方 Cookie，受浏览器隐私策略限制；本次采用 Web 同源代理。
+- 自有域名：可以让 Web/API 位于同一站点，但需要额外域名和 DNS 操作，本次完整测试不要求。
 
 ## 3. 生产拓扑
 
 ```mermaid
 flowchart LR
     U["Chrome 测试用户"] -->|"HTTPS"| W["Railway Web / Next.js"]
-    W -->|"HTTPS REST + 凭据 Cookie"| A["Railway API / FastAPI\n单副本"]
+    W -->|"同源 /api/v1\nSecure HttpOnly Cookie"| P["Next.js 流式 API 代理"]
+    P -->|"Railway 私网 HTTP"| A["Railway API / FastAPI\n单副本"]
     A -->|"私网连接"| DB["Railway PostgreSQL 17"]
     A --> V["持久化卷\n/data/uploads"]
     A --> D["确定性演示 OCR/AI"]
@@ -55,13 +62,16 @@ flowchart LR
 
 - 由现有 Next.js standalone 镜像运行。
 - 监听 Railway 注入的 `PORT`。
-- 构建时注入 API 的公网 HTTPS 基址。
+- 浏览器 API 基址固定为同源 `/api/v1`。
+- Catch-all Route Handler 将所有 `/api/v1/*` 方法、请求体和必要请求头流式转发到 `API_INTERNAL_URL`，并保留状态码、响应体、`Set-Cookie` 与请求 ID；不得把私网地址暴露给浏览器。
+- 代理删除客户端 `Host` 与 hop-by-hop headers，让服务端请求使用 API 私网主机名。
 - 健康检查使用根页面或专用轻量端点，必须返回 HTTP 200。
 - Web 不持有数据库、JWT 或第三方 Provider 密钥。
 
 ### 3.2 API 服务
 
 - 由现有 FastAPI 镜像运行并监听 Railway 注入的 `PORT`。
+- `PORT` 明确固定为 `8000`，供 Web 通过 Railway 私网稳定寻址。
 - 单副本部署。
 - `/health` 仅表示进程可响应，并报告当前 Provider 模式。
 - `/ready` 同时验证数据库可查询和上传目录可写；任一失败时返回非 200。
@@ -88,11 +98,12 @@ flowchart LR
 | `JWT_SECRET` | 由安全随机源生成，至少 32 字节，不得使用开发默认值 |
 | `COOKIE_SECURE` | 固定为 `true` |
 | `ALLOWED_ORIGINS` | 只包含实际 Web HTTPS 地址 |
-| `ALLOWED_HOSTS` | 实际 API 主机名与 `healthcheck.railway.app` |
+| `ALLOWED_HOSTS` | API 公网主机名、`api.railway.internal` 与 `healthcheck.railway.app` |
 | `PROVIDER_MODE` | 固定为 `demo`，禁止 `auto` |
 | `OPENAI_API_KEY` | 不设置 |
 | `UPLOAD_DIR` | 固定为 `/data/uploads` |
 | `MAX_UPLOAD_BYTES` | 保持 10 MiB 业务上限 |
+| `PORT` | 固定为 `8000`，同时用于公网健康检查与私网代理 |
 
 生产启动验证必须拒绝以下配置：开发默认 JWT、非 HTTPS/localhost Origin、`COOKIE_SECURE=false`、`PROVIDER_MODE=auto`、本地数据库默认地址，或缺失的上传目录配置。
 
@@ -100,7 +111,8 @@ flowchart LR
 
 | 变量 | 正式环境要求 |
 | --- | --- |
-| `NEXT_PUBLIC_API_URL` | API 公网 HTTPS 地址加 `/api/v1` |
+| `NEXT_PUBLIC_API_URL` | 固定为同源相对路径 `/api/v1` |
+| `API_INTERNAL_URL` | `http://${{api.RAILWAY_PRIVATE_DOMAIN}}:8000`，仅服务端可见 |
 | `PORT` | 由 Railway 注入，容器必须使用该值 |
 
 ## 5. 迁移、启动与持久化
@@ -110,11 +122,11 @@ flowchart LR
 1. 在 Railway 登录并创建独立项目与 `production` 环境。
 2. 创建 PostgreSQL、API、Web 三个服务。
 3. 为 API 创建 `/data/uploads` 持久化卷并配置单副本。
-4. 生成 API 与 Web 的 Railway HTTPS 域名。
+4. 生成 API 与 Web 的 Railway HTTPS 域名；API 公网域名仅用于运维健康检查和直接 smoke。
 5. 注入变量和强随机 JWT 密钥。
 6. 先发布 API 镜像；Pre-Deploy Command 执行 `alembic upgrade head`。
 7. `/ready` 返回 200 后允许 API 切流。
-8. 使用最终 API 地址构建并发布 Web。
+8. 使用 `NEXT_PUBLIC_API_URL=/api/v1` 与 API 私网地址发布 Web，并先验证代理健康和 Cookie 往返。
 9. 执行远程自动化 smoke，再使用 Chrome 做完整用户流程验收。
 
 ### 5.2 迁移规则
@@ -135,8 +147,8 @@ flowchart LR
 
 ## 6. 安全边界
 
-- 认证 Cookie 必须包含 `Secure`、`HttpOnly` 与 `SameSite=Lax`。
-- 跨域请求只允许最终 Web Origin，并允许凭据；任意其他 Origin 不应获得允许头。
+- 认证 Cookie 必须包含 `Secure`、`HttpOnly` 与 `SameSite=Lax`；经 Web 同源代理返回后，Cookie 归属于 Web 主机。
+- 浏览器不直接跨站调用 API。API 的 CORS 仍只允许最终 Web Origin，作为直接运维请求和错误配置的纵深防护；任意其他 Origin 不应获得允许头。
 - API 接受 Railway 的健康检查 Host，同时拒绝未授权的用户数据访问。
 - 正式环境不创建或重置 `demo@example.com` 公共账号。
 - 测试账号使用本次随机生成的唯一邮箱和强密码；密码不提交到 Git。
@@ -156,8 +168,9 @@ flowchart LR
 
 ### 7.2 远程 smoke
 
-- Web 首页、API `/health` 与 `/ready` 返回预期状态。
-- CORS 预检只允许最终 Web Origin。
+- Web 首页、Web `/health`、API `/health` 与 `/ready` 返回预期状态。
+- Web `/api/v1/*` 代理可以转发 JSON、multipart 上传、Cookie、非 2xx 响应和 `Set-Cookie`，响应中不暴露 `API_INTERNAL_URL`。
+- CORS 预检只允许最终 Web Origin；浏览器用户流程的网络请求全部保持 Web 同源。
 - 注册、登录、当前用户、退出与重新登录正常。
 - 登录响应 Cookie 具备生产安全属性。
 - 上传有效 PNG 成功；超大文件与错误 MIME 被拒绝。
