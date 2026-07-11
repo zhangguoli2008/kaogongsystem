@@ -141,3 +141,43 @@ export interface ReviewRecordPage {
   page_size: number;
   total: number;
 }
+
+export interface TodayReviewResponse {
+  daily_review_limit: 10 | 20 | 30 | 50;
+  pending: Question[];
+  completed: ReviewRecord[];
+  completed_count: number;
+  total: number;
+}
+
+export interface CountByLabel {
+  label: string;
+  count: number;
+}
+
+export interface TrendPoint {
+  date: string;
+  count: number;
+}
+
+export interface AnalyticsSummary {
+  total_questions: number;
+  module_distribution: CountByLabel[];
+  knowledge_point_ranking: CountByLabel[];
+  error_reason_distribution: CountByLabel[];
+  mastery_distribution: CountByLabel[];
+  trend_7d: TrendPoint[];
+  trend_30d: TrendPoint[];
+  ai_summary: string;
+  is_demo: boolean;
+}
+
+export interface DashboardResponse {
+  today_review: TodayReviewResponse;
+  current_question: Question | null;
+  recent_questions: Question[];
+  weak_modules: CountByLabel[];
+  trend_7d: TrendPoint[];
+  ai_advice: string;
+  provider_mode: "auto" | "demo" | "live" | string;
+}
