@@ -9,6 +9,12 @@ from openai import APIConnectionError
 from app.core.errors import APIError
 from app.core.errors import request_id_for
 from app.schemas.analysis import AnalysisInput, AnalysisResult
+from app.schemas.analytics import (
+    AnalyticsAdviceInput,
+    AnalyticsAdviceResult,
+    CountByLabel,
+    TrendPoint,
+)
 from app.schemas.question import ExamModule, QuestionOption
 from app.services.providers.demo import DemoProvider
 from app.services.providers.openai import OpenAIProvider
@@ -27,6 +33,18 @@ def analysis_input() -> AnalysisInput:
         original_explanation="第二季度生产总值=120×(1+10%)=132亿元。",
         ocr_raw_text="OCR 原文",
         module=ExamModule.DATA,
+    )
+
+
+def advice_input() -> AnalyticsAdviceInput:
+    return AnalyticsAdviceInput(
+        total_questions=3,
+        module_distribution=[CountByLabel(label="资料分析", count=2)],
+        knowledge_point_ranking=[CountByLabel(label="增长率", count=2)],
+        error_reason_distribution=[CountByLabel(label="计算错", count=2)],
+        mastery_distribution=[CountByLabel(label="未掌握", count=2)],
+        trend_7d=[TrendPoint(date="2026-07-10", count=1)],
+        trend_30d=[TrendPoint(date="2026-07-10", count=1)],
     )
 
 
@@ -60,6 +78,19 @@ def test_demo_provider_returns_deterministic_structured_analysis():
     assert first.knowledge_points
     assert first.cause_analysis
     assert first.correct_approach
+
+
+def test_demo_provider_returns_deterministic_analytics_advice():
+    first = asyncio.run(DemoProvider().advise(advice_input()))
+    second = asyncio.run(DemoProvider().advise(advice_input()))
+
+    assert first == second
+    assert first == AnalyticsAdviceResult(
+        advice="演示建议：优先复习资料分析中的增长率，再用一组同类题检验掌握情况。",
+        provider_name="demo",
+        model_name=None,
+        is_demo=True,
+    )
 
 
 def test_demo_provider_analysis_uses_answers_and_explanation_without_echoing_them():
@@ -162,6 +193,52 @@ def test_openai_provider_analyze_uses_strict_schema_and_keeps_raw_response():
     assert seen["text"]["format"]["strict"] is True
     assert seen["text"]["format"]["schema"]["additionalProperties"] is False
     assert "suggested_error_reason" in seen["text"]["format"]["schema"]["required"]
+
+
+def test_openai_provider_advice_uses_server_payload_and_strict_schema():
+    seen = {}
+
+    class FakeResponses:
+        async def create(self, **kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(output_text='{"advice":"先复习增长率。"}')
+
+    class FakeClient:
+        responses = FakeResponses()
+
+    provider = OpenAIProvider(api_key="test", model="test-model", client=FakeClient())
+    result = asyncio.run(provider.advise(advice_input(), request_id="local-advice"))
+
+    assert result == AnalyticsAdviceResult(
+        advice="先复习增长率。",
+        provider_name="openai",
+        model_name="test-model",
+        is_demo=False,
+    )
+    assert seen["input"][0]["content"][0]["text"] == advice_input().model_dump_json()
+    schema = seen["text"]["format"]["schema"]
+    assert seen["text"]["format"]["type"] == "json_schema"
+    assert seen["text"]["format"]["strict"] is True
+    assert schema["additionalProperties"] is False
+    assert schema["required"] == ["advice"]
+
+
+def test_openai_provider_advice_rejects_invalid_response():
+    class FakeResponses:
+        async def create(self, **kwargs):
+            del kwargs
+            return SimpleNamespace(output_text='{"advice":"ok","secret":"leak"}')
+
+    class FakeClient:
+        responses = FakeResponses()
+
+    provider = OpenAIProvider(api_key="test", client=FakeClient())
+    with pytest.raises(APIError) as caught:
+        asyncio.run(provider.advise(advice_input(), request_id="local-advice"))
+
+    assert caught.value.status_code == 502
+    assert caught.value.code == "provider_invalid_response"
+    assert "secret" not in caught.value.message
 
 
 def test_openai_connection_errors_map_to_stable_api_error(caplog):

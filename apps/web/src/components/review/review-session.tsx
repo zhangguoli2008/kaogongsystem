@@ -34,7 +34,7 @@ function AnswerAnalysis({ question }: { question: Question }) {
         </div>
         <div className="rounded-lg bg-[#F0FAF7] p-4">
           <p className="text-xs font-medium text-[#397967]">正确答案</p>
-          <p className="mt-2 font-semibold text-[#078766]">{question.correct_answer}</p>
+          <p className="mt-2 font-semibold text-[#006B50]">{question.correct_answer}</p>
         </div>
       </div>
       <div>
@@ -115,7 +115,7 @@ export function ReviewSession({ data, submitReview }: ReviewSessionProps) {
       <section className="rounded-xl border border-[#E4E8F2] bg-white px-6 py-12 text-center" aria-labelledby="review-finished-title">
         <CheckCircle2 className="mx-auto size-11 text-[#10B981]" aria-hidden="true" />
         <h2 id="review-finished-title" className="mt-4 text-xl font-semibold text-[#0D1B4C]">{hasCompleted ? "今日复习已完成" : "暂时没有待复习题"}</h2>
-        <p className="mt-2 text-sm leading-6 text-[#6A7893]">{hasCompleted ? `今天已完成 ${completedCount} 题，学习记录已同步。` : "录入错题后，系统会按掌握状态和薄弱考点安排复习。"}</p>
+        <p className="mt-2 text-sm leading-6 text-[#52627F]">{hasCompleted ? `今天已完成 ${completedCount} 题，学习记录已同步。` : "录入错题后，系统会按掌握状态和薄弱考点安排复习。"}</p>
         <div className="mt-6 flex flex-wrap justify-center gap-3">
           <Link href={hasCompleted ? "/analytics" : "/questions/new"} className="inline-flex h-11 items-center rounded-lg bg-[#4F46E5] px-4 text-sm font-semibold text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4F46E5] focus-visible:ring-offset-2">{hasCompleted ? "查看学习统计" : "录入错题"}</Link>
           <Link href="/questions" className="inline-flex h-11 items-center rounded-lg border border-[#E4E8F2] bg-white px-4 text-sm font-medium text-[#0D1B4C] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4F46E5]">查看错题库</Link>
@@ -128,7 +128,7 @@ export function ReviewSession({ data, submitReview }: ReviewSessionProps) {
     <section aria-labelledby="review-question-title">
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3 text-sm">
         <p className="font-medium text-[#4F46E5]">{completedCount} / {data.total}</p>
-        <p className="text-[#6A7893]">剩余 {pending.length} 题</p>
+        <p className="text-[#52627F]">剩余 {pending.length} 题</p>
       </div>
       <div className="h-2 overflow-hidden rounded-full bg-[#E9ECF3]" role="progressbar" aria-label="复习进度" aria-valuemin={0} aria-valuemax={data.total} aria-valuenow={completedCount}>
         <div className="h-full rounded-full bg-[#4F46E5]" style={{ width: `${data.total ? Math.round((completedCount / data.total) * 100) : 0}%` }} />
@@ -141,7 +141,7 @@ export function ReviewSession({ data, submitReview }: ReviewSessionProps) {
         </div>
         <h2 id="review-question-title" className="mt-5 whitespace-pre-wrap text-lg font-semibold leading-8 text-[#0D1B4C]">{current.stem}</h2>
         {current.options.length ? <ol className="mt-5 space-y-3">{current.options.map((option) => <li key={`${option.label}-${option.content}`} className="rounded-lg border border-[#E8ECF4] px-4 py-3 text-sm leading-6 text-[#314568]"><span className="mr-2 font-semibold text-[#0D1B4C]">{option.label}.</span>{option.content}</li>)}</ol> : null}
-        <div className="mt-5 rounded-lg bg-[#F7F8FC] p-4"><p className="text-xs font-medium text-[#6A7893]">我的答案</p><p className="mt-2 font-semibold text-[#0D1B4C]">{current.user_answer}</p></div>
+        <div className="mt-5 rounded-lg bg-[#F7F8FC] p-4"><p className="text-xs font-medium text-[#52627F]">我的答案</p><p className="mt-2 font-semibold text-[#0D1B4C]">{current.user_answer}</p></div>
 
         {!revealed ? (
           <Button className="mt-6 w-full sm:w-auto" onClick={() => setRevealed(true)}><Eye className="size-4" aria-hidden="true" />查看答案与解析</Button>

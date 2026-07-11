@@ -45,7 +45,7 @@ export function ReviewHero({ data, currentQuestion }: ReviewHeroProps) {
         <div className="mt-6 flex flex-col items-start gap-5 border-t border-[#E8ECF4] pt-6 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <p className="font-medium text-[#0D1B4C]">录入错题后，系统会生成今日复习计划。</p>
-            <p className="mt-2 text-sm leading-6 text-[#6A7893]">系统会优先安排未掌握、复习中和近期新增的题目。</p>
+            <p className="mt-2 text-sm leading-6 text-[#52627F]">系统会优先安排未掌握、复习中和近期新增的题目。</p>
           </div>
           {actionLink("/questions/new", "录入第一道错题")}
         </div>
@@ -61,7 +61,7 @@ export function ReviewHero({ data, currentQuestion }: ReviewHeroProps) {
           >
             <div className="h-full rounded-full bg-[#4F46E5]" style={{ width: `${percent}%` }} />
           </div>
-          <p className="mt-4 flex flex-wrap items-center gap-x-5 gap-y-2 text-sm text-[#6A7893]">
+          <p className="mt-4 flex flex-wrap items-center gap-x-5 gap-y-2 text-sm text-[#52627F]">
             <span className="inline-flex items-center gap-1.5">
               <CheckCircle2 className="size-4 text-[#10B981]" aria-hidden="true" />
               已完成 {completed} 题
@@ -76,7 +76,7 @@ export function ReviewHero({ data, currentQuestion }: ReviewHeroProps) {
             <div className="mt-6 flex flex-col items-start gap-5 border-t border-[#E8ECF4] pt-6 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <p className="text-lg font-semibold text-[#0D1B4C]">今日计划已完成</p>
-                <p className="mt-2 text-sm text-[#6A7893]">做得不错，去统计页看看本轮复习后的变化。</p>
+                <p className="mt-2 text-sm text-[#52627F]">做得不错，去统计页看看本轮复习后的变化。</p>
               </div>
               {actionLink("/analytics", "查看学习统计")}
             </div>

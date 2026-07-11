@@ -4,7 +4,10 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import update
 from sqlalchemy.dialects import postgresql
 
+from app.core.errors import APIError
+from app.core.rate_limit import RateLimiter
 from app.models.question import Question
+from app.schemas.analytics import AnalyticsAdviceResult
 from app.services.analytics import trend_for_days
 
 
@@ -164,3 +167,135 @@ def test_dashboard_uses_current_user_data_and_never_calls_a_provider(client, mon
     assert foreign["id"] not in [item["id"] for item in dashboard["recent_questions"]]
     assert len(dashboard["trend_7d"]) == 7
     assert dashboard["ai_advice"]
+
+
+def test_analytics_gets_never_construct_a_provider(client, monkeypatch):
+    cookies = register(client, "analytics-read-only@example.com")
+    create_question(client, cookies)
+
+    def provider_should_not_be_called(*args, **kwargs):
+        raise AssertionError("read-only analytics must never construct a provider")
+
+    monkeypatch.setattr(
+        "app.api.routes.analytics.get_provider", provider_should_not_be_called
+    )
+
+    assert client.get("/api/v1/analytics/summary", cookies=cookies).status_code == 200
+    assert client.get("/api/v1/dashboard", cookies=cookies).status_code == 200
+
+
+def test_post_analytics_advice_uses_owner_aggregate_and_calls_provider_once(
+    client, monkeypatch
+):
+    owner = register(client, "advice-owner@example.com")
+    create_question(client, owner, module="资料分析", knowledge_points=["增长率"])
+    other = register(client, "advice-other@example.com")
+    create_question(client, other, module="判断推理", knowledge_points=["图形推理"])
+    seen = {"calls": 0}
+
+    class CapturingProvider:
+        async def advise(self, payload, request_id=None):
+            seen["calls"] += 1
+            seen["payload"] = payload
+            seen["request_id"] = request_id
+            return AnalyticsAdviceResult(
+                advice="先练增长率。",
+                provider_name="test-provider",
+                model_name="test-model",
+                is_demo=False,
+            )
+
+    monkeypatch.setattr(
+        "app.api.routes.analytics.get_provider", lambda settings: CapturingProvider()
+    )
+    response = client.post(
+        "/api/v1/analytics/advice",
+        cookies=owner,
+        headers={"x-request-id": "advice-local-id"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "advice": "先练增长率。",
+        "provider_name": "test-provider",
+        "model_name": "test-model",
+        "is_demo": False,
+    }
+    assert seen["calls"] == 1
+    assert seen["request_id"] == "advice-local-id"
+    assert seen["payload"].total_questions == 1
+    assert {item.label for item in seen["payload"].module_distribution} == {"资料分析"}
+    assert "图形推理" not in {
+        item.label for item in seen["payload"].knowledge_point_ranking
+    }
+
+
+def test_post_analytics_advice_reuses_provider_rate_limit(client, monkeypatch):
+    cookies = register(client, "advice-rate-limit@example.com")
+    client.app.state.provider_rate_limiter = RateLimiter(limit=1, window_seconds=60)
+
+    class Provider:
+        async def advise(self, payload, request_id=None):
+            del payload, request_id
+            return AnalyticsAdviceResult(
+                advice="建议",
+                provider_name="demo",
+                model_name=None,
+                is_demo=True,
+            )
+
+    monkeypatch.setattr(
+        "app.api.routes.analytics.get_provider", lambda settings: Provider()
+    )
+    first = client.post("/api/v1/analytics/advice", cookies=cookies)
+    second = client.post("/api/v1/analytics/advice", cookies=cookies)
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert second.json()["code"] == "provider_rate_limited"
+
+
+def test_post_analytics_advice_revalidates_provider_result(client, monkeypatch):
+    cookies = register(client, "advice-invalid@example.com")
+
+    class InvalidProvider:
+        async def advise(self, payload, request_id=None):
+            del payload, request_id
+            return {
+                "advice": "looks valid",
+                "provider_name": "malicious-provider",
+                "model_name": None,
+                "is_demo": False,
+                "secret": "must not cross the route boundary",
+            }
+
+    monkeypatch.setattr(
+        "app.api.routes.analytics.get_provider", lambda settings: InvalidProvider()
+    )
+    response = client.post("/api/v1/analytics/advice", cookies=cookies)
+
+    assert response.status_code == 502
+    assert response.json()["code"] == "provider_invalid_response"
+    assert "secret" not in response.json()["message"]
+
+
+def test_post_analytics_advice_preserves_stable_provider_api_error(client, monkeypatch):
+    cookies = register(client, "advice-provider-error@example.com")
+
+    class FailingProvider:
+        async def advise(self, payload, request_id=None):
+            del payload, request_id
+            raise APIError(
+                502,
+                "provider_api_error",
+                "AI 建议服务暂时不可用",
+            )
+
+    monkeypatch.setattr(
+        "app.api.routes.analytics.get_provider", lambda settings: FailingProvider()
+    )
+    response = client.post("/api/v1/analytics/advice", cookies=cookies)
+
+    assert response.status_code == 502
+    assert response.json()["code"] == "provider_api_error"
+    assert response.json()["message"] == "AI 建议服务暂时不可用"

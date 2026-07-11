@@ -13,7 +13,7 @@ export function ModuleChart({ data, total }: { data: CountByLabel[]; total: numb
     <section className="rounded-xl border border-[#E4E8F2] bg-white p-5" aria-labelledby="module-chart-title">
       <div className="flex items-baseline justify-between gap-3">
         <h2 id="module-chart-title" className="font-semibold text-[#0D1B4C]">五大模块错题占比</h2>
-        <p className="text-sm text-[#6A7893]">共 {total} 题</p>
+        <p className="text-sm text-[#52627F]">共 {total} 题</p>
       </div>
       <div className="mt-4 grid gap-5 sm:grid-cols-[minmax(13rem,0.9fr)_minmax(0,1.1fr)] sm:items-center">
         <div className="h-52 min-w-0" aria-hidden="true">
@@ -34,7 +34,7 @@ export function ModuleChart({ data, total }: { data: CountByLabel[]; total: numb
                 <span className="size-2.5 rounded-full" style={{ backgroundColor: chartColors[index % chartColors.length] }} aria-hidden="true" />
                 <span className="font-medium text-[#314568]">{item.label}</span>
                 <span className="text-[#0D1B4C]">{item.count} 题</span>
-                <span className="w-12 text-right text-[#6A7893]">{percent.toFixed(1)}%</span>
+                <span className="w-12 text-right text-[#52627F]">{percent.toFixed(1)}%</span>
               </li>
             );
           })}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.schemas.analysis import AnalysisInput, AnalysisResult
+from app.schemas.analytics import AnalyticsAdviceInput, AnalyticsAdviceResult
 from app.schemas.question import ErrorReason, ExamModule, QuestionOption
 from app.schemas.upload import OcrResult
 
@@ -102,6 +103,30 @@ class DemoProvider:
             study_advice=study_advice,
             suggested_error_reason=suggested_error_reason,
             raw_response=raw_response,
+            provider_name="demo",
+            model_name=None,
+            is_demo=True,
+        )
+
+    async def advise(
+        self, payload: AnalyticsAdviceInput, request_id: str | None = None
+    ) -> AnalyticsAdviceResult:
+        del request_id
+        if payload.total_questions == 0 or not payload.module_distribution:
+            advice = "先录入错题，系统会根据你的数据生成学习建议。"
+        else:
+            module = payload.module_distribution[0].label
+            knowledge_point = (
+                payload.knowledge_point_ranking[0].label
+                if payload.knowledge_point_ranking
+                else "核心知识点"
+            )
+            advice = (
+                f"演示建议：优先复习{module}中的{knowledge_point}，"
+                "再用一组同类题检验掌握情况。"
+            )
+        return AnalyticsAdviceResult(
+            advice=advice,
             provider_name="demo",
             model_name=None,
             is_demo=True,

@@ -172,6 +172,13 @@ export interface AnalyticsSummary {
   is_demo: boolean;
 }
 
+export interface AnalyticsAdviceResult {
+  advice: string;
+  provider_name: string;
+  model_name: string | null;
+  is_demo: boolean;
+}
+
 export interface DashboardResponse {
   today_review: TodayReviewResponse;
   current_question: Question | null;

@@ -18,6 +18,11 @@ from app.schemas.analysis import (
     AnalysisProviderResponse,
     AnalysisResult,
 )
+from app.schemas.analytics import (
+    AnalyticsAdviceInput,
+    AnalyticsAdviceProviderResponse,
+    AnalyticsAdviceResult,
+)
 from app.schemas.upload import OcrResult
 
 logger = logging.getLogger(__name__)
@@ -30,6 +35,11 @@ OCR_INSTRUCTIONS = (
 ANALYSIS_INSTRUCTIONS = (
     "分析这道公考错题的错误原因、知识点、正确思路和学习建议。"
     "仅返回指定 JSON 结构，不要添加额外字段。"
+)
+
+ADVICE_INSTRUCTIONS = (
+    "根据服务端提供的错题统计生成一段简洁、可执行的公考复习建议。"
+    "不要声称看到了统计之外的数据，仅返回指定 JSON 结构，不要添加额外字段。"
 )
 
 
@@ -238,6 +248,90 @@ class OpenAIProvider:
         return AnalysisResult(
             **parsed.model_dump(),
             raw_response=parsed.model_dump(mode="json"),
+            provider_name="openai",
+            model_name=self.model,
+            is_demo=False,
+        )
+
+    async def advise(
+        self, payload: AnalyticsAdviceInput, request_id: str | None = None
+    ) -> AnalyticsAdviceResult:
+        local_request_id = request_id or self.request_id
+        try:
+            response = await self.client.responses.create(
+                model=self.model,
+                instructions=ADVICE_INSTRUCTIONS,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": payload.model_dump_json(),
+                            }
+                        ],
+                    }
+                ],
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "analytics_advice",
+                        "strict": True,
+                        "schema": AnalyticsAdviceProviderResponse.model_json_schema(),
+                    }
+                },
+            )
+        except APITimeoutError as exc:
+            self._log_provider_error(exc, "timeout", local_request_id=local_request_id)
+            raise APIError(504, "provider_timeout", "AI 建议服务响应超时") from exc
+        except APIConnectionError as exc:
+            self._log_provider_error(
+                exc, "connection", local_request_id=local_request_id
+            )
+            raise APIError(502, "provider_connection_error", "AI 建议服务连接失败") from exc
+        except RateLimitError as exc:
+            self._log_provider_error(
+                exc, "rate_limit", local_request_id=local_request_id
+            )
+            raise APIError(429, "provider_rate_limited", "AI 建议服务请求过于频繁") from exc
+        except APIStatusError as exc:
+            self._log_provider_error(
+                exc,
+                "status",
+                getattr(exc.response, "status_code", None),
+                local_request_id=local_request_id,
+            )
+            status = getattr(exc.response, "status_code", 502)
+            code = "provider_rate_limited" if status == 429 else "provider_api_error"
+            message = (
+                "AI 建议服务请求过于频繁"
+                if status == 429
+                else "AI 建议服务暂时不可用"
+            )
+            raise APIError(429 if status == 429 else 502, code, message) from exc
+        except Exception as exc:
+            self._log_provider_error(
+                exc, "unexpected", local_request_id=local_request_id
+            )
+            raise APIError(502, "provider_api_error", "AI 建议服务暂时不可用") from exc
+
+        try:
+            parsed = AnalyticsAdviceProviderResponse.model_validate_json(
+                response.output_text
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            self._log_provider_metadata(
+                category="invalid_response",
+                provider_request_id=getattr(response, "_request_id", None),
+                status_code=getattr(response, "status_code", 200),
+                local_request_id=local_request_id,
+            )
+            raise APIError(
+                502, "provider_invalid_response", "AI 建议服务返回内容无效"
+            ) from exc
+
+        return AnalyticsAdviceResult(
+            advice=parsed.advice,
             provider_name="openai",
             model_name=self.model,
             is_demo=False,
