@@ -2,7 +2,7 @@ import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { QuestionLibrary } from "./question-library";
+import { localDayBoundary, QuestionLibrary } from "./question-library";
 import { apiFetch } from "@/lib/api";
 import { renderWithProviders } from "@/test/test-utils";
 
@@ -54,5 +54,14 @@ describe("QuestionLibrary", () => {
     await waitFor(() => {
       expect(apiFetchMock).toHaveBeenCalledWith(`/questions?${expected.toString()}`);
     });
+  });
+
+  it("converts a UTC+8 local day without relying on the CI timezone", () => {
+    const timezone = vi.spyOn(Date.prototype, "getTimezoneOffset").mockReturnValue(-480);
+
+    expect(localDayBoundary("2026-07-11", false)).toBe("2026-07-10T16:00:00.000Z");
+    expect(localDayBoundary("2026-07-11", true)).toBe("2026-07-11T15:59:59.999Z");
+
+    timezone.mockRestore();
   });
 });

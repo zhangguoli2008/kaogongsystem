@@ -142,6 +142,11 @@ describe("QuestionTable", () => {
     renderWithProviders(<QuestionTable items={twoQuestions} />);
 
     const mobileList = screen.getByRole("list", { name: "移动端错题列表" });
+    expect(mobileList).toHaveClass("xl:hidden");
+    expect(mobileList).not.toHaveClass("md:hidden", "lg:hidden");
+    const desktopTableContainer = screen.getByRole("table").parentElement;
+    expect(desktopTableContainer).toHaveClass("hidden", "xl:block");
+    expect(desktopTableContainer).not.toHaveClass("md:block", "lg:block");
     expect(within(mobileList).getByRole("link", { name: "资料分析题一" })).toHaveAttribute("href", "/questions/q1");
     expect(within(mobileList).getByText("增长率")).toBeVisible();
     expect(within(mobileList).getByText("粗心")).toBeVisible();

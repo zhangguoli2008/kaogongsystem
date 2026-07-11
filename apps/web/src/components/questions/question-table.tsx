@@ -164,7 +164,7 @@ export function QuestionTable({ items }: QuestionTableProps) {
         </div>
       ) : (
         <>
-          <ul className="divide-y divide-[#E8ECF4] md:hidden" aria-label="移动端错题列表">
+          <ul className="divide-y divide-[#E8ECF4] xl:hidden" aria-label="移动端错题列表">
             {items.map((item) => (
               <li key={item.id} className="space-y-4 px-4 py-5">
                 <div className="flex items-start gap-3">
@@ -193,7 +193,7 @@ export function QuestionTable({ items }: QuestionTableProps) {
               </li>
             ))}
           </ul>
-          <div className="hidden overflow-x-auto md:block">
+          <div className="hidden overflow-x-auto xl:block">
           <table className="w-full min-w-[980px] text-left text-sm">
             <thead className="border-b border-[#E8ECF4] bg-[#FBFCFE] text-xs font-medium text-[#6A7893]">
               <tr>

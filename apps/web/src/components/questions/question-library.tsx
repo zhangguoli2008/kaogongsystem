@@ -11,18 +11,31 @@ import { Button } from "@/components/ui/button";
 import { ApiError, apiFetch } from "@/lib/api";
 import type { QuestionPage } from "@/types/api";
 
-function localDayBoundary(value: string, endOfDay: boolean) {
+export function localDayBoundary(value: string, endOfDay: boolean) {
   const [year, month, day] = value.split("-").map(Number);
-  const date = new Date(
+  const hour = endOfDay ? 23 : 0;
+  const minute = endOfDay ? 59 : 0;
+  const second = endOfDay ? 59 : 0;
+  const millisecond = endOfDay ? 999 : 0;
+  const localBoundary = new Date(
     year,
     month - 1,
     day,
-    endOfDay ? 23 : 0,
-    endOfDay ? 59 : 0,
-    endOfDay ? 59 : 0,
-    endOfDay ? 999 : 0,
+    hour,
+    minute,
+    second,
+    millisecond,
   );
-  return date.toISOString();
+  const utcTimestamp = Date.UTC(
+    year,
+    month - 1,
+    day,
+    hour,
+    minute,
+    second,
+    millisecond,
+  ) + localBoundary.getTimezoneOffset() * 60_000;
+  return new Date(utcTimestamp).toISOString();
 }
 
 function requestParams(searchParams: URLSearchParams) {
