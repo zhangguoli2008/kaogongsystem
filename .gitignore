@@ -27,3 +27,6 @@ out/
 coverage/
 .worktrees/
 .superpowers/
+*.db
+.data/
+uploads/
