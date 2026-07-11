@@ -1,15 +1,45 @@
 from functools import lru_cache
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 
 
 AppEnvironment = Literal["development", "test", "production"]
 DEFAULT_DATABASE_URL = "postgresql+psycopg://kaogong:kaogong@db:5432/kaogong"
 DEFAULT_JWT_SECRET = "development-secret-change-in-production"
+
+
+def _is_loopback_host(host: str) -> bool:
+    normalized_host = host.rstrip(".").casefold()
+    if normalized_host == "localhost":
+        return True
+    try:
+        return ip_address(normalized_host).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_valid_production_origin(origin: str) -> bool:
+    try:
+        parsed = urlsplit(origin)
+        _ = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname is not None
+        and not _is_loopback_host(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path in {"", "/"}
+        and "?" not in origin
+        and "#" not in origin
+    )
 
 
 class Settings(BaseSettings):
@@ -51,19 +81,20 @@ class Settings(BaseSettings):
 
         try:
             database = make_url(self.database_url)
+            database_host = database.host
             database_is_remote_postgres = (
                 database.get_backend_name() in {"postgres", "postgresql"}
-                and database.host not in {None, "localhost", "127.0.0.1", "db"}
+                and database_host is not None
+                and database_host.rstrip(".").casefold() != "db"
+                and not _is_loopback_host(database_host)
             )
-        except ValueError:
+        except (ArgumentError, ValueError):
             database_is_remote_postgres = False
         if not database_is_remote_postgres:
             errors.append("DATABASE_URL must use remote PostgreSQL")
 
         if len(self.allowed_origins) != 1 or any(
-            urlsplit(origin).scheme != "https"
-            or urlsplit(origin).hostname in {None, "localhost", "127.0.0.1"}
-            for origin in self.allowed_origins
+            not _is_valid_production_origin(origin) for origin in self.allowed_origins
         ):
             errors.append("ALLOWED_ORIGINS must contain only HTTPS non-local origins")
         if (

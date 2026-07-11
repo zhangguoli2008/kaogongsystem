@@ -60,6 +60,57 @@ def test_production_configuration_rejects_unsafe_values(
 
 
 @pytest.mark.parametrize(
+    "host",
+    [
+        "LOCALHOST",
+        "LOCALHOST.",
+        "127.0.0.2",
+        "127.255.255.254",
+        "[::1]",
+        "[::ffff:127.0.0.1]",
+    ],
+)
+def test_production_configuration_rejects_loopback_database_hosts(
+    tmp_path: Path, host: str
+) -> None:
+    database_url = f"postgresql://user:pass@{host}/kaogong"
+
+    with pytest.raises(ValueError, match="DATABASE_URL"):
+        create_app(production_settings(tmp_path, database_url=database_url))
+
+
+def test_production_configuration_reports_malformed_database_url(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="DATABASE_URL"):
+        create_app(
+            production_settings(tmp_path, database_url="not a valid database URL")
+        )
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://[::1]",
+        "https://127.0.0.2",
+        "https://user@example.com",
+        "https://example.com/path",
+        "https://example.com?query=value",
+        "https://example.com#fragment",
+        "https://example.com?",
+        "https://example.com#",
+        "https://example.com:invalid",
+        "https://[::1",
+    ],
+)
+def test_production_configuration_rejects_non_origin_urls(
+    tmp_path: Path, origin: str
+) -> None:
+    with pytest.raises(ValueError, match="ALLOWED_ORIGINS"):
+        create_app(production_settings(tmp_path, allowed_origins=[origin]))
+
+
+@pytest.mark.parametrize(
     ("source", "expected"),
     [
         (
