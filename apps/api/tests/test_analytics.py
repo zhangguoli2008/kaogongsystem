@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from sqlalchemy import update
 from sqlalchemy.dialects import postgresql
 
@@ -156,7 +157,13 @@ def test_dashboard_uses_current_user_data_and_never_calls_a_provider(client, mon
         raise AssertionError("dashboard must not make a paid provider request")
 
     monkeypatch.setattr(
-        "app.services.providers.factory.get_provider", provider_should_not_be_called
+        "app.api.routes.dashboard.get_provider",
+        provider_should_not_be_called,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "app.services.providers.demo.DemoProvider.advise",
+        provider_should_not_be_called,
     )
     response = client.get("/api/v1/dashboard", cookies=owner)
 
@@ -178,6 +185,15 @@ def test_analytics_gets_never_construct_a_provider(client, monkeypatch):
 
     monkeypatch.setattr(
         "app.api.routes.analytics.get_provider", provider_should_not_be_called
+    )
+    monkeypatch.setattr(
+        "app.api.routes.dashboard.get_provider",
+        provider_should_not_be_called,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "app.services.providers.demo.DemoProvider.advise",
+        provider_should_not_be_called,
     )
 
     assert client.get("/api/v1/analytics/summary", cookies=cookies).status_code == 200
@@ -233,9 +249,12 @@ def test_post_analytics_advice_uses_owner_aggregate_and_calls_provider_once(
 def test_post_analytics_advice_reuses_provider_rate_limit(client, monkeypatch):
     cookies = register(client, "advice-rate-limit@example.com")
     client.app.state.provider_rate_limiter = RateLimiter(limit=1, window_seconds=60)
+    calls = 0
 
     class Provider:
         async def advise(self, payload, request_id=None):
+            nonlocal calls
+            calls += 1
             del payload, request_id
             return AnalyticsAdviceResult(
                 advice="建议",
@@ -253,6 +272,7 @@ def test_post_analytics_advice_reuses_provider_rate_limit(client, monkeypatch):
     assert first.status_code == 200
     assert second.status_code == 429
     assert second.json()["code"] == "provider_rate_limited"
+    assert calls == 1
 
 
 def test_post_analytics_advice_revalidates_provider_result(client, monkeypatch):
@@ -266,7 +286,6 @@ def test_post_analytics_advice_revalidates_provider_result(client, monkeypatch):
                 "provider_name": "malicious-provider",
                 "model_name": None,
                 "is_demo": False,
-                "secret": "must not cross the route boundary",
             }
 
     monkeypatch.setattr(
@@ -276,20 +295,83 @@ def test_post_analytics_advice_revalidates_provider_result(client, monkeypatch):
 
     assert response.status_code == 502
     assert response.json()["code"] == "provider_invalid_response"
-    assert "secret" not in response.json()["message"]
 
 
-def test_post_analytics_advice_preserves_stable_provider_api_error(client, monkeypatch):
-    cookies = register(client, "advice-provider-error@example.com")
+def test_post_analytics_advice_revalidates_mutated_result_instance(client, monkeypatch):
+    cookies = register(client, "advice-mutated-result@example.com")
+
+    class MutatingProvider:
+        async def advise(self, payload, request_id=None):
+            del payload, request_id
+            result = AnalyticsAdviceResult(
+                advice="initially valid",
+                provider_name="mutating-provider",
+                model_name=None,
+                is_demo=False,
+            )
+            result.advice = ""
+            return result
+
+    monkeypatch.setattr(
+        "app.api.routes.analytics.get_provider", lambda settings: MutatingProvider()
+    )
+    response = client.post("/api/v1/analytics/advice", cookies=cookies)
+
+    assert response.status_code == 502
+    assert response.json()["code"] == "provider_invalid_response"
+
+
+@pytest.mark.parametrize(
+    ("provider_code", "expected_status", "expected_message"),
+    [
+        ("provider_timeout", 504, "AI 建议服务响应超时"),
+        ("provider_connection_error", 502, "AI 建议服务连接失败"),
+        ("provider_rate_limited", 429, "AI 建议服务请求过于频繁"),
+        ("provider_invalid_response", 502, "AI 建议服务返回内容无效"),
+        ("provider_api_error", 502, "AI 建议服务暂时不可用"),
+    ],
+)
+def test_post_analytics_advice_maps_known_provider_api_errors(
+    client, monkeypatch, provider_code, expected_status, expected_message
+):
+    cookies = register(client, f"advice-{provider_code}@example.com")
 
     class FailingProvider:
         async def advise(self, payload, request_id=None):
             del payload, request_id
             raise APIError(
-                502,
-                "provider_api_error",
-                "AI 建议服务暂时不可用",
+                418,
+                provider_code,
+                "supplier secret",
             )
+
+    monkeypatch.setattr(
+        "app.api.routes.analytics.get_provider", lambda settings: FailingProvider()
+    )
+    response = client.post("/api/v1/analytics/advice", cookies=cookies)
+
+    assert response.status_code == expected_status
+    assert response.json()["code"] == provider_code
+    assert response.json()["message"] == expected_message
+    assert "supplier" not in response.text
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        APIError(418, "supplier_debug", "supplier secret"),
+        RuntimeError("supplier secret"),
+    ],
+)
+def test_post_analytics_advice_hides_unknown_provider_errors(
+    client, monkeypatch, failure
+):
+    cookies = register(client, f"advice-unknown-{type(failure).__name__}@example.com")
+
+    class FailingProvider:
+        async def advise(self, payload, request_id=None):
+            del payload, request_id
+            raise failure
 
     monkeypatch.setattr(
         "app.api.routes.analytics.get_provider", lambda settings: FailingProvider()
@@ -299,3 +381,4 @@ def test_post_analytics_advice_preserves_stable_provider_api_error(client, monke
     assert response.status_code == 502
     assert response.json()["code"] == "provider_api_error"
     assert response.json()["message"] == "AI 建议服务暂时不可用"
+    assert "supplier" not in response.text

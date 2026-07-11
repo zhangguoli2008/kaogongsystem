@@ -81,6 +81,24 @@ const todayReview: TodayReviewResponse = {
   total: 2,
 };
 
+function colorChannel(value: number) {
+  const normalized = value / 255;
+  return normalized <= 0.04045 ? normalized / 12.92 : ((normalized + 0.055) / 1.055) ** 2.4;
+}
+
+function luminance(hex: string) {
+  const value = hex.replace("#", "");
+  return 0.2126 * colorChannel(Number.parseInt(value.slice(0, 2), 16))
+    + 0.7152 * colorChannel(Number.parseInt(value.slice(2, 4), 16))
+    + 0.0722 * colorChannel(Number.parseInt(value.slice(4, 6), 16));
+}
+
+function contrastRatio(foreground: string, background: string) {
+  const lighter = Math.max(luminance(foreground), luminance(background));
+  const darker = Math.min(luminance(foreground), luminance(background));
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
 describe("ReviewSession", () => {
   it("hides the answer until the learner explicitly reveals it", async () => {
     const user = userEvent.setup();
@@ -118,5 +136,17 @@ describe("ReviewSession", () => {
     expect(await screen.findByText("第二题题干")).toBeVisible();
     expect(screen.queryByText("第一题题干")).not.toBeInTheDocument();
     expect(screen.getByText("1 / 2")).toBeVisible();
+  });
+
+  it("keeps the review-note placeholder at WCAG AA contrast", async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<ReviewSession data={todayReview} submitReview={vi.fn()} />);
+
+    await user.click(screen.getByRole("button", { name: "查看答案与解析" }));
+    const note = screen.getByPlaceholderText("记录本次容易忽略的步骤（可选）");
+    const placeholderColor = note.className.match(/placeholder:text-\[#([0-9A-F]{6})\]/)?.[1];
+
+    expect(placeholderColor).toBeDefined();
+    expect(contrastRatio(`#${placeholderColor}`, "#FFFFFF")).toBeGreaterThanOrEqual(4.5);
   });
 });

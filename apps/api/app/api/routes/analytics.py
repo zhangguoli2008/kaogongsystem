@@ -4,6 +4,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
 from pydantic import ValidationError
+from pydantic_core import PydanticSerializationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
@@ -20,6 +21,22 @@ from app.services.providers.factory import get_provider
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 Session = Annotated[AsyncSession, Depends(get_session)]
+
+_ADVICE_PROVIDER_ERRORS: dict[str, tuple[int, str]] = {
+    "provider_timeout": (504, "AI 建议服务响应超时"),
+    "provider_connection_error": (502, "AI 建议服务连接失败"),
+    "provider_rate_limited": (429, "AI 建议服务请求过于频繁"),
+    "provider_invalid_response": (502, "AI 建议服务返回内容无效"),
+    "provider_api_error": (502, "AI 建议服务暂时不可用"),
+}
+
+
+def _public_provider_error(error: APIError) -> APIError:
+    known = _ADVICE_PROVIDER_ERRORS.get(error.code)
+    if known is None:
+        return APIError(502, "provider_api_error", "AI 建议服务暂时不可用")
+    status_code, message = known
+    return APIError(status_code, error.code, message)
 
 
 @router.get("/summary", response_model=AnalyticsSummary)
@@ -54,11 +71,28 @@ async def analytics_advice(
         trend_7d=summary.trend_7d,
         trend_30d=summary.trend_30d,
     )
-    provider = get_provider(request.app.state.settings)
-    result = await provider.advise(payload, request_id=request_id_for(request))
     try:
-        return AnalyticsAdviceResult.model_validate(result)
-    except (ValidationError, TypeError, ValueError) as exc:
+        provider = get_provider(request.app.state.settings)
+        result = await provider.advise(payload, request_id=request_id_for(request))
+    except APIError as exc:
+        raise _public_provider_error(exc) from exc
+    except Exception as exc:
+        raise APIError(
+            502,
+            "provider_api_error",
+            "AI 建议服务暂时不可用",
+        ) from exc
+    try:
+        if not isinstance(result, AnalyticsAdviceResult):
+            raise TypeError("provider returned an unexpected result type")
+        dumped = result.model_dump(mode="json", warnings="error")
+        return AnalyticsAdviceResult.model_validate(dumped)
+    except (
+        PydanticSerializationError,
+        ValidationError,
+        TypeError,
+        ValueError,
+    ) as exc:
         raise APIError(
             502,
             "provider_invalid_response",

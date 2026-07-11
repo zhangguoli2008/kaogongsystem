@@ -150,7 +150,7 @@ export function ReviewSession({ data, submitReview }: ReviewSessionProps) {
             <AnswerAnalysis question={current} />
             <div className="mt-6 border-t border-[#E8ECF4] pt-6">
               <label htmlFor="review-note" className="text-sm font-medium text-[#0D1B4C]">本次复习笔记</label>
-              <textarea id="review-note" rows={3} value={note} onChange={(event) => setNote(event.target.value)} placeholder="记录本次容易忽略的步骤（可选）" className="mt-2 w-full resize-y rounded-lg border border-[#D7DDEA] bg-white px-3 py-2.5 text-sm text-[#0D1B4C] outline-none placeholder:text-[#94A0B5] focus:border-[#4F46E5] focus:ring-2 focus:ring-[#4F46E5]/15" />
+              <textarea id="review-note" rows={3} value={note} onChange={(event) => setNote(event.target.value)} placeholder="记录本次容易忽略的步骤（可选）" className="mt-2 w-full resize-y rounded-lg border border-[#D7DDEA] bg-white px-3 py-2.5 text-sm text-[#0D1B4C] outline-none placeholder:text-[#52627F] focus:border-[#4F46E5] focus:ring-2 focus:ring-[#4F46E5]/15" />
               {error ? <p className="mt-3 text-sm text-[#C33746]" role="alert">{error}</p> : null}
               <div className="mt-5 grid gap-3 sm:grid-cols-3" aria-label="选择本次掌握状态">
                 <Button variant="secondary" disabled={submitting} onClick={() => handleSubmit("未掌握")}><XCircle className="size-4 text-[#EF5D68]" aria-hidden="true" />仍未掌握</Button>
