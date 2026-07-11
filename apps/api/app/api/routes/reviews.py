@@ -50,6 +50,34 @@ async def update_review_settings(
     return ReviewSettingsRead(daily_review_limit=settings.daily_review_limit)
 
 
+@router.get(
+    "/questions/{question_id}",
+    response_model=list[ReviewRecordRead],
+)
+async def question_review_history(
+    question_id: str,
+    current_user: CurrentUser,
+    session: Session,
+) -> list[ReviewRecord]:
+    question = await session.scalar(
+        select(Question).where(
+            Question.id == question_id, Question.user_id == current_user.id
+        )
+    )
+    if question is None:
+        raise APIError(404, "not_found", "错题不存在")
+
+    records = await session.scalars(
+        select(ReviewRecord)
+        .where(
+            ReviewRecord.question_id == question.id,
+            ReviewRecord.user_id == current_user.id,
+        )
+        .order_by(ReviewRecord.reviewed_at.desc(), ReviewRecord.id.desc())
+    )
+    return list(records)
+
+
 @router.post(
     "/{question_id}",
     response_model=ReviewRecordRead,

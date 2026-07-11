@@ -1,11 +1,11 @@
-import { RoutePlaceholder } from "@/components/layout/route-placeholder";
+import { Suspense } from "react";
+
+import { QuestionLibrary } from "@/components/questions/question-library";
 
 export default function QuestionsPage() {
   return (
-    <RoutePlaceholder
-      title="错题库"
-      description="你可以在这里查找、筛选和管理已经保存的错题。"
-      action={{ href: "/questions/new", label: "录入错题" }}
-    />
+    <Suspense fallback={<div className="rounded-xl border border-[#E4E8F2] bg-white px-6 py-14 text-center text-sm text-[#6A7893]" role="status">正在加载错题库…</div>}>
+      <QuestionLibrary />
+    </Suspense>
   );
 }

@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy import update
 
 from app.models.question import Question
-from app.models.review import UserSettings
+from app.models.review import ReviewRecord, UserSettings
 from app.schemas.question import MasteryStatus
 from app.services.review import score_review_candidate
 
@@ -76,6 +76,19 @@ def set_review_limit(client, user_id: str, limit: int) -> None:
             await session.commit()
 
     asyncio.run(set_limit())
+
+
+def set_reviewed_at(client, review_id: str, reviewed_at: datetime) -> None:
+    async def set_timestamp():
+        async with client.app.state.session_factory() as session:
+            await session.execute(
+                update(ReviewRecord)
+                .where(ReviewRecord.id == review_id)
+                .values(reviewed_at=reviewed_at)
+            )
+            await session.commit()
+
+    asyncio.run(set_timestamp())
 
 
 def test_review_score_matches_spec():
@@ -198,6 +211,51 @@ def test_review_submission_is_scoped_to_the_current_user(client):
         f"/api/v1/reviews/{question['id']}",
         cookies=other,
         json={"result_status": "已掌握"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "not_found"
+
+
+def test_question_review_history_is_empty_for_an_owned_question(client):
+    cookies = register(client, "review-history-empty@example.com")
+    question = create_question(client, cookies)
+
+    response = client.get(
+        f"/api/v1/reviews/questions/{question['id']}", cookies=cookies
+    )
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_question_review_history_is_newest_first_and_question_scoped(client):
+    cookies = register(client, "review-history-order@example.com")
+    question = create_question(client, cookies)
+    other_question = create_question(client, cookies)
+    older = submit_review(client, cookies, question["id"], "复习中")
+    newer = submit_review(client, cookies, question["id"], "已掌握")
+    submit_review(client, cookies, other_question["id"], "未掌握")
+    now = datetime.now(timezone.utc)
+    set_reviewed_at(client, older["id"], now - timedelta(days=1))
+    set_reviewed_at(client, newer["id"], now)
+
+    response = client.get(
+        f"/api/v1/reviews/questions/{question['id']}", cookies=cookies
+    )
+
+    assert response.status_code == 200
+    assert [record["id"] for record in response.json()] == [newer["id"], older["id"]]
+
+
+def test_question_review_history_hides_another_users_question(client):
+    owner = register(client, "review-history-owner@example.com")
+    question = create_question(client, owner)
+    submit_review(client, owner, question["id"])
+    other = register(client, "review-history-other@example.com")
+
+    response = client.get(
+        f"/api/v1/reviews/questions/{question['id']}", cookies=other
     )
 
     assert response.status_code == 404
