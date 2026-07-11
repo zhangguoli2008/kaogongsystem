@@ -28,18 +28,20 @@ export function AppHeader({ user, onOpenNavigation }: AppHeaderProps) {
       >
         <Menu className="size-5" aria-hidden="true" />
       </Button>
-      <div className="hidden items-center gap-2 text-sm font-medium text-[#314568] sm:flex lg:ml-auto">
-        <CalendarDays className="size-5 text-[#0D1B4C]" aria-hidden="true" />
-        <time dateTime={new Date().toISOString().slice(0, 10)}>{date}</time>
-      </div>
-      <div className="flex items-center gap-3 text-right">
-        <div className="hidden sm:block">
-          <p className="text-sm font-medium text-[#0D1B4C]">{user.email}</p>
-          <p className="mt-0.5 text-xs text-[#6A7893]">备考学员</p>
+      <div className="ml-auto flex items-center gap-6" aria-label="学习日期与当前用户">
+        <div className="hidden items-center gap-2 text-sm font-medium text-[#314568] sm:flex">
+          <CalendarDays className="size-5 text-[#0D1B4C]" aria-hidden="true" />
+          <time dateTime={new Date().toISOString().slice(0, 10)}>{date}</time>
         </div>
-        <span className="flex size-9 items-center justify-center rounded-full bg-[#EEF0FF] text-sm font-semibold text-[#4F46E5]" aria-label="当前用户">
-          {user.email.slice(0, 1).toUpperCase()}
-        </span>
+        <div className="flex items-center gap-3 text-right">
+          <div className="hidden sm:block">
+            <p className="text-sm font-medium text-[#0D1B4C]">{user.email}</p>
+            <p className="mt-0.5 text-xs text-[#6A7893]">备考学员</p>
+          </div>
+          <span className="flex size-9 items-center justify-center rounded-full bg-[#EEF0FF] text-sm font-semibold text-[#4F46E5]" aria-label="当前用户">
+            {user.email.slice(0, 1).toUpperCase()}
+          </span>
+        </div>
       </div>
     </header>
   );

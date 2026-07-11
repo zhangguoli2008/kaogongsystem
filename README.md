@@ -41,7 +41,7 @@ bash scripts/smoke.sh
 | API | <http://localhost:8000> | FastAPI；健康检查为 `/health` |
 | PostgreSQL | `localhost:5432` | 仅供本地开发连接 |
 
-PostgreSQL 数据存放在 Compose 命名卷 `postgres_data`，上传图片存放在命名卷 `uploads`。`docker compose down` 只停止并移除本项目容器和网络，不删除数据卷。只有确定要清空本项目全部本地数据时，才使用 `docker compose down -v`。
+这些端口默认只绑定宿主机回环地址 `127.0.0.1`，不会直接暴露给局域网。PostgreSQL 数据存放在 Compose 命名卷 `postgres_data`，上传图片存放在命名卷 `uploads`。`docker compose down` 只停止并移除本项目容器和网络，不删除数据卷。只有确定要清空本项目全部本地数据时，才使用 `docker compose down -v`。
 
 ## 常用命令
 
