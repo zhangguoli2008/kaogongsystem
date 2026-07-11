@@ -13,6 +13,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Validate live-provider credentials before serving any traffic.  Deferring
     # this check to an OCR request would turn an operator misconfiguration into
     # a user-facing 500 response.
+    resolved.validate_for_startup()
     provider_mode = resolved.effective_provider_mode
     app = FastAPI(title="AI 公考错题诊断系统")
     app.state.settings = resolved
