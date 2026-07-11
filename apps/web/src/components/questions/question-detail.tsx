@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, FileText } from "lucide-react";
 import Link from "next/link";
@@ -8,7 +9,7 @@ import { AnalysisPanel } from "@/components/questions/analysis-panel";
 import { QuestionForm } from "@/components/questions/question-form";
 import { Button } from "@/components/ui/button";
 import { ApiError, apiFetch } from "@/lib/api";
-import type { Question, ReviewRecord } from "@/types/api";
+import type { Question, ReviewRecordPage } from "@/types/api";
 
 interface QuestionDetailProps {
   id: string;
@@ -25,13 +26,14 @@ function displayText(value: string | null | undefined, fallback = "暂无内容"
 
 export function QuestionDetail({ id }: QuestionDetailProps) {
   const queryClient = useQueryClient();
+  const [historyPage, setHistoryPage] = useState(1);
   const detail = useQuery({
     queryKey: ["question", id],
     queryFn: () => apiFetch<Question>(`/questions/${id}`),
   });
   const history = useQuery({
-    queryKey: ["question-reviews", id],
-    queryFn: () => apiFetch<ReviewRecord[]>(`/reviews/questions/${id}`),
+    queryKey: ["question-reviews", id, historyPage],
+    queryFn: () => apiFetch<ReviewRecordPage>(`/reviews/questions/${id}?page=${historyPage}&page_size=10`),
     enabled: Boolean(detail.data),
   });
 
@@ -77,10 +79,10 @@ export function QuestionDetail({ id }: QuestionDetailProps) {
             <Button className="mt-3" size="sm" variant="secondary" onClick={() => history.refetch()}>重新加载复习记录</Button>
           </div>
         ) : null}
-        {history.data?.length === 0 ? <p className="mt-3 text-sm leading-6 text-[#6A7893]">暂无复习记录。完成今日复习后，系统会保存本次结果和笔记。</p> : null}
-        {history.data?.length ? (
+        {history.data?.items.length === 0 ? <p className="mt-3 text-sm leading-6 text-[#6A7893]">暂无复习记录。完成今日复习后，系统会保存本次结果和笔记。</p> : null}
+        {history.data?.items.length ? (
           <ol className="mt-4 divide-y divide-[#E8ECF4]">
-            {history.data.map((record) => (
+            {history.data.items.map((record) => (
               <li key={record.id} className="py-4 first:pt-0 last:pb-0">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="rounded-md bg-[#F1F3F9] px-2 py-1 text-xs font-medium text-[#52627F]">{record.result_status}</span>
@@ -92,6 +94,15 @@ export function QuestionDetail({ id }: QuestionDetailProps) {
               </li>
             ))}
           </ol>
+        ) : null}
+        {history.data && history.data.total > history.data.page_size ? (
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-[#E8ECF4] pt-4 text-sm text-[#6A7893]" aria-label="复习记录分页">
+            <span>第 {history.data.page} / {Math.ceil(history.data.total / history.data.page_size)} 页，共 {history.data.total} 条</span>
+            <div className="flex gap-2">
+              <Button size="sm" variant="secondary" aria-label="上一页复习记录" disabled={history.data.page <= 1} onClick={() => setHistoryPage((page) => page - 1)}>上一页</Button>
+              <Button size="sm" variant="secondary" aria-label="下一页复习记录" disabled={history.data.page * history.data.page_size >= history.data.total} onClick={() => setHistoryPage((page) => page + 1)}>下一页</Button>
+            </div>
+          </div>
         ) : null}
       </section>
 

@@ -1,9 +1,9 @@
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { QuestionTable } from "./question-table";
-import { apiFetch } from "@/lib/api";
+import { ApiError, apiFetch } from "@/lib/api";
 import { renderWithProviders } from "@/test/test-utils";
 import type { Question } from "@/types/api";
 
@@ -136,5 +136,53 @@ describe("QuestionTable", () => {
     expect(confirm).toHaveFocus();
     await user.tab();
     expect(cancel).toHaveFocus();
+  });
+
+  it("renders a narrow-screen question list with the priority fields", () => {
+    renderWithProviders(<QuestionTable items={twoQuestions} />);
+
+    const mobileList = screen.getByRole("list", { name: "移动端错题列表" });
+    expect(within(mobileList).getByRole("link", { name: "资料分析题一" })).toHaveAttribute("href", "/questions/q1");
+    expect(within(mobileList).getByText("增长率")).toBeVisible();
+    expect(within(mobileList).getByText("粗心")).toBeVisible();
+    expect(within(mobileList).getByText("已完成")).toBeVisible();
+  });
+
+  it("supports selection and deletion from the narrow-screen list", async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<QuestionTable items={twoQuestions} />);
+    const mobileList = screen.getByRole("list", { name: "移动端错题列表" });
+
+    await user.click(within(mobileList).getByRole("checkbox", { name: "选择卡片错题 资料分析题一" }));
+    await user.click(screen.getByRole("button", { name: "批量删除" }));
+    await user.click(screen.getByRole("button", { name: "确认删除" }));
+
+    await waitFor(() => {
+      expect(apiFetchMock).toHaveBeenCalledWith("/questions/bulk-delete", {
+        method: "POST",
+        body: JSON.stringify({ ids: ["q1"] }),
+      });
+    });
+  });
+
+  it("shows deletion failures inside the dialog and allows retry", async () => {
+    const user = userEvent.setup();
+    apiFetchMock
+      .mockRejectedValueOnce(new ApiError(503, { code: "service_unavailable", message: "删除服务暂时不可用" }))
+      .mockResolvedValueOnce({ deleted: 2, not_found: [] });
+    renderWithProviders(<QuestionTable items={twoQuestions} />);
+
+    await user.click(screen.getByRole("checkbox", { name: "选择全部错题" }));
+    await user.click(screen.getByRole("button", { name: "批量删除" }));
+    await user.click(screen.getByRole("button", { name: "确认删除" }));
+
+    const dialog = screen.getByRole("dialog", { name: "确认删除错题" });
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("删除服务暂时不可用");
+    await user.click(within(dialog).getByRole("button", { name: "确认删除" }));
+
+    await waitFor(() => {
+      expect(apiFetchMock).toHaveBeenCalledTimes(2);
+      expect(screen.queryByRole("dialog", { name: "确认删除错题" })).not.toBeInTheDocument();
+    });
   });
 });

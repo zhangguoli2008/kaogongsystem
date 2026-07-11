@@ -36,9 +36,10 @@ interface DeleteDialogProps {
   onConfirm: () => void;
   isPending: boolean;
   returnFocus: HTMLElement | null;
+  error: string | null;
 }
 
-function DeleteDialog({ count, onCancel, onConfirm, isPending, returnFocus }: DeleteDialogProps) {
+function DeleteDialog({ count, onCancel, onConfirm, isPending, returnFocus, error }: DeleteDialogProps) {
   const cancelButton = useRef<HTMLButtonElement>(null);
   const dialog = useRef<HTMLElement>(null);
 
@@ -75,6 +76,7 @@ function DeleteDialog({ count, onCancel, onConfirm, isPending, returnFocus }: De
       <section ref={dialog} role="dialog" aria-modal="true" aria-labelledby="bulk-delete-title" className="w-full max-w-md rounded-xl border border-[#E4E8F2] bg-white p-6 shadow-xl">
         <h2 id="bulk-delete-title" className="text-lg font-semibold text-[#0D1B4C]">确认删除错题</h2>
         <p className="mt-3 text-sm leading-6 text-[#52627F]">将永久删除已选择的 {count} 道错题及其分析和复习记录，此操作无法撤销。</p>
+        {error ? <p className="mt-4 rounded-lg border border-[#FFD7DB] bg-[#FFF7F8] px-3 py-2 text-sm text-[#C33746]" role="alert">{error}</p> : null}
         <div className="mt-6 flex justify-end gap-3">
           <Button ref={cancelButton} variant="secondary" onClick={onCancel} disabled={isPending}>取消</Button>
           <Button className="border-[#D84755] bg-[#D84755] hover:bg-[#BE3442]" onClick={onConfirm} disabled={isPending}>
@@ -154,14 +156,44 @@ export function QuestionTable({ items }: QuestionTableProps) {
           </div>
         ) : null}
       </div>
-      {actionError ? <p className="mx-5 mt-4 text-sm text-[#D84755]" role="alert">{actionError}</p> : null}
+      {actionError && !pendingDelete ? <p className="mx-5 mt-4 text-sm text-[#D84755]" role="alert">{actionError}</p> : null}
       {items.length === 0 ? (
         <div className="px-6 py-14 text-center">
           <p className="text-base font-medium text-[#0D1B4C]">暂无符合条件的错题</p>
           <p className="mt-2 text-sm text-[#6A7893]">调整筛选条件，或先录入一道错题开始复盘。</p>
         </div>
       ) : (
-        <div className="overflow-x-auto">
+        <>
+          <ul className="divide-y divide-[#E8ECF4] md:hidden" aria-label="移动端错题列表">
+            {items.map((item) => (
+              <li key={item.id} className="space-y-4 px-4 py-5">
+                <div className="flex items-start gap-3">
+                  <input
+                    type="checkbox"
+                    aria-label={`选择卡片错题 ${item.stem}`}
+                    checked={selected.includes(item.id)}
+                    onChange={() => toggleOne(item.id)}
+                    className="mt-1 size-4 shrink-0 accent-[#4F46E5]"
+                  />
+                  <div className="min-w-0 flex-1">
+                    <Link href={`/questions/${item.id}`} className="line-clamp-3 font-medium leading-6 text-[#0D1B4C] hover:text-[#4F46E5] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4F46E5]">{item.stem}</Link>
+                    <p className="mt-1 text-xs text-[#6A7893]">{item.module} · {dateLabel(item.created_at)}</p>
+                  </div>
+                </div>
+                <dl className="grid grid-cols-2 gap-3 text-sm">
+                  <div><dt className="text-xs text-[#6A7893]">知识点</dt><dd className="mt-1 text-[#314568]">{item.knowledge_points.length ? item.knowledge_points.join("、") : "—"}</dd></div>
+                  <div><dt className="text-xs text-[#6A7893]">错因</dt><dd className="mt-1 text-[#314568]">{item.error_reason ?? "—"}</dd></div>
+                  <div><dt className="text-xs text-[#6A7893]">掌握状态</dt><dd className="mt-1"><span className={`inline-flex rounded-md px-2 py-1 text-xs font-medium ${chipClassName(item.mastery_status)}`}>{item.mastery_status}</span></dd></div>
+                  <div><dt className="text-xs text-[#6A7893]">AI 状态</dt><dd className="mt-1"><span className={`inline-flex rounded-md px-2 py-1 text-xs font-medium ${chipClassName(item.analysis_status)}`}>{item.analysis_status}</span></dd></div>
+                </dl>
+                <div className="flex items-center justify-end gap-1 border-t border-[#E8ECF4] pt-3">
+                  <Link href={`/questions/${item.id}`} className="inline-flex h-9 items-center gap-1 rounded-lg px-3 text-sm font-medium text-[#4F46E5] hover:bg-[#EEF0FF] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4F46E5]">查看详情<ChevronRight className="size-4" aria-hidden="true" /></Link>
+                  <Button variant="ghost" size="icon" aria-label={`删除卡片错题 ${item.stem}`} onClick={() => requestDeletion([item.id])}><Trash2 className="size-4 text-[#D84755]" aria-hidden="true" /></Button>
+                </div>
+              </li>
+            ))}
+          </ul>
+          <div className="hidden overflow-x-auto md:block">
           <table className="w-full min-w-[980px] text-left text-sm">
             <thead className="border-b border-[#E8ECF4] bg-[#FBFCFE] text-xs font-medium text-[#6A7893]">
               <tr>
@@ -192,9 +224,10 @@ export function QuestionTable({ items }: QuestionTableProps) {
               ))}
             </tbody>
           </table>
-        </div>
+          </div>
+        </>
       )}
-      {pendingDelete ? <DeleteDialog count={pendingDelete.length} onCancel={() => setPendingDelete(null)} onConfirm={() => deleteQuestions.mutate(pendingDelete)} isPending={deleteQuestions.isPending} returnFocus={deleteReturnFocus} /> : null}
+      {pendingDelete ? <DeleteDialog count={pendingDelete.length} onCancel={() => setPendingDelete(null)} onConfirm={() => deleteQuestions.mutate(pendingDelete)} isPending={deleteQuestions.isPending} returnFocus={deleteReturnFocus} error={actionError} /> : null}
     </section>
   );
 }

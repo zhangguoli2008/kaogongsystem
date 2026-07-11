@@ -5,6 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.schemas.common import Pagination
 from app.schemas.question import MasteryStatus, QuestionRead
 
 
@@ -22,6 +23,10 @@ class ReviewRecordRead(BaseModel):
     result_status: MasteryStatus
     review_note: str | None
     reviewed_at: datetime
+
+
+class ReviewRecordPage(Pagination):
+    items: list[ReviewRecordRead]
 
 
 class ReviewSettingsUpdate(BaseModel):

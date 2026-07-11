@@ -51,25 +51,27 @@ describe("QuestionDetail", () => {
   it("loads and displays real review history newest first", async () => {
     apiFetchMock.mockImplementation(async (path) => {
       if (path === "/questions/q1") return question;
-      if (path === "/reviews/questions/q1") {
-        return [
-          {
+      if (path === "/reviews/questions/q1?page=1&page_size=10") {
+        return {
+          items: [{
             id: "r2",
             question_id: "q1",
             user_id: "u1",
             result_status: "已掌握",
             review_note: "第二次复盘",
             reviewed_at: "2026-07-11T08:00:00Z",
-          },
-          {
+          }, {
             id: "r1",
             question_id: "q1",
             user_id: "u1",
             result_status: "复习中",
             review_note: "第一次复盘",
             reviewed_at: "2026-07-10T08:00:00Z",
-          },
-        ];
+          }],
+          page: 1,
+          page_size: 10,
+          total: 2,
+        };
       }
       throw new Error(`unexpected path: ${path}`);
     });
@@ -79,7 +81,7 @@ describe("QuestionDetail", () => {
     expect(await screen.findByText("第二次复盘")).toBeVisible();
     expect(screen.getByText("第一次复盘")).toBeVisible();
     await waitFor(() => {
-      expect(apiFetchMock).toHaveBeenCalledWith("/reviews/questions/q1");
+      expect(apiFetchMock).toHaveBeenCalledWith("/reviews/questions/q1?page=1&page_size=10");
     });
   });
 
@@ -95,7 +97,38 @@ describe("QuestionDetail", () => {
     expect(await screen.findByText("复习记录加载失败，请稍后重试")).toBeVisible();
     await user.click(screen.getByRole("button", { name: "重新加载复习记录" }));
     await waitFor(() => {
-      expect(apiFetchMock.mock.calls.filter(([path]) => path === "/reviews/questions/q1")).toHaveLength(2);
+      expect(apiFetchMock.mock.calls.filter(([path]) => path === "/reviews/questions/q1?page=1&page_size=10")).toHaveLength(2);
     });
+  });
+
+  it("pages through review history", async () => {
+    const user = userEvent.setup();
+    apiFetchMock.mockImplementation(async (path) => {
+      if (path === "/questions/q1") return question;
+      if (path === "/reviews/questions/q1?page=1&page_size=10") {
+        return {
+          items: [{ id: "r1", question_id: "q1", user_id: "u1", result_status: "复习中", review_note: "第一页记录", reviewed_at: "2026-07-11T08:00:00Z" }],
+          page: 1,
+          page_size: 10,
+          total: 11,
+        };
+      }
+      if (path === "/reviews/questions/q1?page=2&page_size=10") {
+        return {
+          items: [{ id: "r11", question_id: "q1", user_id: "u1", result_status: "未掌握", review_note: "第二页记录", reviewed_at: "2026-07-01T08:00:00Z" }],
+          page: 2,
+          page_size: 10,
+          total: 11,
+        };
+      }
+      throw new Error(`unexpected path: ${path}`);
+    });
+
+    renderWithProviders(<QuestionDetail id="q1" />);
+    expect(await screen.findByText("第一页记录")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "下一页复习记录" }));
+
+    expect(await screen.findByText("第二页记录")).toBeVisible();
+    expect(apiFetchMock).toHaveBeenCalledWith("/reviews/questions/q1?page=2&page_size=10");
   });
 });

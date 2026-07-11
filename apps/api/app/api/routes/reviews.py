@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, Query, status
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
@@ -13,6 +13,7 @@ from app.models.question import Question
 from app.models.review import ReviewRecord, UserSettings
 from app.schemas.review import (
     ReviewRecordRead,
+    ReviewRecordPage,
     ReviewSettingsRead,
     ReviewSettingsUpdate,
     ReviewSubmit,
@@ -52,13 +53,15 @@ async def update_review_settings(
 
 @router.get(
     "/questions/{question_id}",
-    response_model=list[ReviewRecordRead],
+    response_model=ReviewRecordPage,
 )
 async def question_review_history(
     question_id: str,
     current_user: CurrentUser,
     session: Session,
-) -> list[ReviewRecord]:
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> ReviewRecordPage:
     question = await session.scalar(
         select(Question).where(
             Question.id == question_id, Question.user_id == current_user.id
@@ -67,15 +70,26 @@ async def question_review_history(
     if question is None:
         raise APIError(404, "not_found", "错题不存在")
 
+    filters = [
+        ReviewRecord.question_id == question.id,
+        ReviewRecord.user_id == current_user.id,
+    ]
+    total = await session.scalar(
+        select(func.count()).select_from(ReviewRecord).where(*filters)
+    )
     records = await session.scalars(
         select(ReviewRecord)
-        .where(
-            ReviewRecord.question_id == question.id,
-            ReviewRecord.user_id == current_user.id,
-        )
+        .where(*filters)
         .order_by(ReviewRecord.reviewed_at.desc(), ReviewRecord.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
     )
-    return list(records)
+    return ReviewRecordPage(
+        items=list(records),
+        page=page,
+        page_size=page_size,
+        total=total or 0,
+    )
 
 
 @router.post(

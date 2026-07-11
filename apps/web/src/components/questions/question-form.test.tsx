@@ -198,4 +198,25 @@ describe("QuestionForm", () => {
     });
     expect(apiFetchMock).not.toHaveBeenCalledWith("/questions/question-1/analyze", expect.anything());
   });
+
+  it("preserves unsaved edits when analysis updates the same question cache", async () => {
+    const user = userEvent.setup();
+    const { rerender } = renderWithProviders(<QuestionForm mode="manual" question={existingQuestion} />);
+    await user.clear(screen.getByLabelText("题干"));
+    await user.type(screen.getByLabelText("题干"), "尚未保存的编辑");
+
+    rerender(
+      <QuestionForm
+        mode="manual"
+        question={{
+          ...existingQuestion,
+          analysis_status: "已完成",
+          current_analysis_id: "analysis-1",
+          updated_at: "2026-07-11T00:00:00Z",
+        }}
+      />,
+    );
+
+    expect(screen.getByLabelText("题干")).toHaveValue("尚未保存的编辑");
+  });
 });

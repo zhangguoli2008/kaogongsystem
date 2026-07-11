@@ -134,3 +134,10 @@ export interface ReviewRecord {
   review_note: string | null;
   reviewed_at: string;
 }
+
+export interface ReviewRecordPage {
+  items: ReviewRecord[];
+  page: number;
+  page_size: number;
+  total: number;
+}

@@ -11,14 +11,28 @@ import { Button } from "@/components/ui/button";
 import { ApiError, apiFetch } from "@/lib/api";
 import type { QuestionPage } from "@/types/api";
 
+function localDayBoundary(value: string, endOfDay: boolean) {
+  const [year, month, day] = value.split("-").map(Number);
+  const date = new Date(
+    year,
+    month - 1,
+    day,
+    endOfDay ? 23 : 0,
+    endOfDay ? 59 : 0,
+    endOfDay ? 59 : 0,
+    endOfDay ? 999 : 0,
+  );
+  return date.toISOString();
+}
+
 function requestParams(searchParams: URLSearchParams) {
   const params = new URLSearchParams(searchParams.toString());
   params.set("page", params.get("page") || "1");
   params.set("page_size", "20");
   const createdFrom = params.get("created_from");
   const createdTo = params.get("created_to");
-  if (createdFrom) params.set("created_from", `${createdFrom}T00:00:00.000Z`);
-  if (createdTo) params.set("created_to", `${createdTo}T23:59:59.999Z`);
+  if (createdFrom) params.set("created_from", localDayBoundary(createdFrom, false));
+  if (createdTo) params.set("created_to", localDayBoundary(createdTo, true));
   return params.toString();
 }
 

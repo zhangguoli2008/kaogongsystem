@@ -226,7 +226,12 @@ def test_question_review_history_is_empty_for_an_owned_question(client):
     )
 
     assert response.status_code == 200
-    assert response.json() == []
+    assert response.json() == {
+        "items": [],
+        "page": 1,
+        "page_size": 20,
+        "total": 0,
+    }
 
 
 def test_question_review_history_is_newest_first_and_question_scoped(client):
@@ -240,12 +245,33 @@ def test_question_review_history_is_newest_first_and_question_scoped(client):
     set_reviewed_at(client, older["id"], now - timedelta(days=1))
     set_reviewed_at(client, newer["id"], now)
 
-    response = client.get(
-        f"/api/v1/reviews/questions/{question['id']}", cookies=cookies
+    first_page = client.get(
+        f"/api/v1/reviews/questions/{question['id']}?page=1&page_size=1",
+        cookies=cookies,
+    )
+    second_page = client.get(
+        f"/api/v1/reviews/questions/{question['id']}?page=2&page_size=1",
+        cookies=cookies,
     )
 
-    assert response.status_code == 200
-    assert [record["id"] for record in response.json()] == [newer["id"], older["id"]]
+    assert first_page.status_code == 200
+    assert first_page.json()["total"] == 2
+    assert first_page.json()["page"] == 1
+    assert first_page.json()["page_size"] == 1
+    assert [record["id"] for record in first_page.json()["items"]] == [newer["id"]]
+    assert [record["id"] for record in second_page.json()["items"]] == [older["id"]]
+
+
+def test_question_review_history_limits_page_size(client):
+    cookies = register(client, "review-history-page-size@example.com")
+    question = create_question(client, cookies)
+
+    response = client.get(
+        f"/api/v1/reviews/questions/{question['id']}?page_size=101",
+        cookies=cookies,
+    )
+
+    assert response.status_code == 422
 
 
 def test_question_review_history_hides_another_users_question(client):

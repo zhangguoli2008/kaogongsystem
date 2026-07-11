@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useFieldArray, useForm } from "react-hook-form";
 import { Plus, Save, Trash2 } from "lucide-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -98,8 +98,11 @@ export function QuestionForm({ mode, question, onSaved }: QuestionFormProps) {
     formState: { errors },
   } = useForm<QuestionFormValues>({ defaultValues: valuesFor(question) });
   const options = useFieldArray({ control, name: "options" });
+  const loadedQuestionId = useRef(question?.id);
 
   useEffect(() => {
+    if (loadedQuestionId.current === question?.id) return;
+    loadedQuestionId.current = question?.id;
     reset(valuesFor(question));
   }, [question, reset]);
 
