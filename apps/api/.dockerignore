@@ -3,6 +3,7 @@
 __pycache__
 *.py[cod]
 tests
+*.db
 .env
 .env.*
 !.env.example

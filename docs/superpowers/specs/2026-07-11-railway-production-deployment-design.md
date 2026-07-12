@@ -30,10 +30,12 @@
 
 从当前工作区根目录分别向 Web 与 API 服务执行：
 
-- API：`railway up apps/api --path-as-root --service api`
+- API：`railway up apps/api --path-as-root`
 - Web：`railway up apps/web --path-as-root --service web`
 
 `--path-as-root` 让每个现有 Dockerfile 继续使用自己的应用目录作为构建上下文，避免改变已经通过本地验证的 `COPY` 边界。每个应用目录内新增独立的 `railway.json`，固定 Dockerfile builder、单副本、健康检查和 API 的迁移/卷要求。
+
+`apps/api/railway.json` 明确使用 Dockerfile 构建，并固定 `alembic upgrade head` Pre-Deploy Command、单副本、`/ready` 健康检查、必需的 `/data/uploads` 挂载和失败重启策略。
 
 该方式不依赖新增 GitHub 仓库，能发布当前已完成本地 QA 的确切源码状态，也适合本次“一次完整正式环境测试”的目标。
 
@@ -77,7 +79,7 @@ flowchart LR
 - `/ready` 同时验证数据库可查询和上传目录可写；任一失败时返回非 200。
 - Railway 发布健康检查指向 `/ready`。
 - 上传卷挂载到 `/data/uploads`；运行用户必须经过真实写入探针验证。
-- 如果 Railway 的卷以 root 所有者挂载，则启动阶段只使用最小 root 权限修正卷目录所有权，随后降权到应用用户运行 Uvicorn。
+- Railway 的卷以 root 所有者挂载。API 镜像不通过 Dockerfile 的 `USER` 提前固定非 root 身份，而由唯一入口程序短暂以 root 确保 `/data/uploads` 存在并修正所有权，然后按 `setgroups`、`setgid`、`setuid` 的顺序立即降权到 UID/GID 10001；验证应用用户对目录可写且可进入后才运行 Uvicorn。
 
 ### 3.3 PostgreSQL 服务
 
@@ -133,6 +135,7 @@ flowchart LR
 
 - 迁移从 API 镜像中的 `apps/api` 工作目录执行。
 - Pre-Deploy Command 只访问数据库，不依赖应用进程或上传卷。
+- API 镜像为支持卷所有权引导而不设置 Dockerfile `USER`，因此 `alembic upgrade head` 会在短命 Pre-Deploy 容器中以 root 运行；该阶段不挂载或写入上传卷，应用服务仍由唯一入口程序立即降权到 UID/GID 10001。
 - 不在每个 API 容器启动时重复运行迁移。
 - 不执行 `alembic downgrade` 作为常规回滚手段；若未来存在数据迁移，先备份后发布。
 - 本次数据库为空，失败时优先修复部署并重跑 upgrade，不使用破坏性清库绕过问题。
