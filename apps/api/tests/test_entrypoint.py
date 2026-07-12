@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -44,7 +45,11 @@ def test_prepare_runtime_chowns_volume_then_drops_root_privileges(
     monkeypatch.setattr(
         entrypoint.os, "setuid", lambda uid: calls.append(("setuid", uid))
     )
-    monkeypatch.setattr(entrypoint.os, "access", lambda path, mode: True)
+    monkeypatch.setattr(
+        entrypoint.os,
+        "access",
+        lambda path, mode: calls.append(("access", path, mode)) or True,
+    )
 
     entrypoint.prepare_runtime(upload_dir)
 
@@ -54,14 +59,17 @@ def test_prepare_runtime_chowns_volume_then_drops_root_privileges(
         ("setgroups", []),
         ("setgid", 10001),
         ("setuid", 10001),
+        ("access", upload_dir, entrypoint.os.W_OK | entrypoint.os.X_OK),
     ]
 
 
-def test_prepare_runtime_does_not_change_identity_when_not_root(
+def test_prepare_runtime_accepts_exact_application_identity_without_change(
     monkeypatch, tmp_path: Path
 ) -> None:
     upload_dir = tmp_path / "uploads"
     monkeypatch.setattr(entrypoint.os, "geteuid", lambda: 10001)
+    monkeypatch.setattr(entrypoint.os, "getegid", lambda: 10001)
+    monkeypatch.setattr(entrypoint.os, "getgroups", lambda: [])
     monkeypatch.setattr(
         entrypoint.os,
         "chown",
@@ -82,11 +90,49 @@ def test_prepare_runtime_does_not_change_identity_when_not_root(
         "setuid",
         lambda *args: pytest.fail("non-root startup must not set uid"),
     )
-    monkeypatch.setattr(entrypoint.os, "access", lambda path, mode: True)
+    monkeypatch.setattr(
+        entrypoint.os,
+        "access",
+        lambda path, mode: True,
+    )
 
     entrypoint.prepare_runtime(upload_dir)
 
     assert upload_dir.is_dir()
+
+
+@pytest.mark.parametrize(
+    ("euid", "egid", "groups"),
+    [
+        (10002, 10001, []),
+        (10001, 10002, []),
+        (10001, 10001, [10001]),
+    ],
+)
+def test_prepare_runtime_rejects_unexpected_non_root_identity_before_filesystem(
+    monkeypatch,
+    tmp_path: Path,
+    euid: int,
+    egid: int,
+    groups: list[int],
+) -> None:
+    upload_dir = tmp_path / "uploads"
+    monkeypatch.setattr(entrypoint.os, "geteuid", lambda: euid)
+    monkeypatch.setattr(entrypoint.os, "getegid", lambda: egid)
+    monkeypatch.setattr(entrypoint.os, "getgroups", lambda: groups)
+    monkeypatch.setattr(
+        entrypoint.os,
+        "access",
+        lambda path, mode: pytest.fail(
+            "identity rejection must precede filesystem access"
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        entrypoint.prepare_runtime(upload_dir)
+
+    assert str(exc_info.value) == "UPLOAD_DIR runtime identity is invalid"
+    assert not upload_dir.exists()
 
 
 def test_prepare_runtime_fails_when_upload_directory_is_not_writable(
@@ -95,6 +141,8 @@ def test_prepare_runtime_fails_when_upload_directory_is_not_writable(
     upload_dir = tmp_path / "uploads"
     checked: list[tuple[Path, int]] = []
     monkeypatch.setattr(entrypoint.os, "geteuid", lambda: 10001)
+    monkeypatch.setattr(entrypoint.os, "getegid", lambda: 10001)
+    monkeypatch.setattr(entrypoint.os, "getgroups", lambda: [])
     monkeypatch.setattr(
         entrypoint.os,
         "access",
@@ -122,6 +170,11 @@ def test_main_validates_then_prepares_runtime_before_starting_uvicorn(
     monkeypatch.setattr(entrypoint, "get_settings", lambda: settings)
     monkeypatch.setattr(
         entrypoint,
+        "resolve_port",
+        lambda raw: calls.append(("resolve_port", raw)) or 49152,
+    )
+    monkeypatch.setattr(
+        entrypoint,
         "prepare_runtime",
         lambda path: calls.append(("prepare_runtime", path)),
     )
@@ -135,6 +188,7 @@ def test_main_validates_then_prepares_runtime_before_starting_uvicorn(
 
     assert calls == [
         ("validate",),
+        ("resolve_port", "49152"),
         ("prepare_runtime", upload_dir),
         (
             "uvicorn.run",
@@ -203,6 +257,17 @@ def test_dockerfile_leaves_identity_drop_to_entrypoint() -> None:
     )
 
 
+def test_dockerfile_keeps_application_code_root_owned() -> None:
+    dockerfile = (API_ROOT / "Dockerfile").read_text().replace("\\\n", " ")
+    chown_commands = [
+        line.strip() for line in dockerfile.splitlines() if "chown" in line
+    ]
+
+    assert chown_commands
+    assert all("/app" not in command for command in chown_commands)
+    assert any("/data/uploads" in command for command in chown_commands)
+
+
 def test_dockerfile_default_command_uses_entrypoint() -> None:
     instructions = [
         line.strip()
@@ -211,6 +276,12 @@ def test_dockerfile_default_command_uses_entrypoint() -> None:
     ]
 
     assert instructions[-1] == 'CMD ["python", "-m", "app.entrypoint"]'
+
+
+def test_railway_manifest_pins_entrypoint_start_command() -> None:
+    manifest = json.loads((API_ROOT / "railway.json").read_text())
+
+    assert manifest["deploy"]["startCommand"] == "python -m app.entrypoint"
 
 
 def test_dockerignore_excludes_local_secrets_and_test_artifacts() -> None:
@@ -225,4 +296,20 @@ def test_dockerignore_excludes_local_secrets_and_test_artifacts() -> None:
         "*.py[cod]",
         "*.db",
         "tests",
+        "!.env.example",
+    } <= patterns
+
+
+def test_dockerignore_excludes_nested_secrets_and_test_artifacts() -> None:
+    patterns = set((API_ROOT / ".dockerignore").read_text().splitlines())
+
+    assert {
+        "**/.env",
+        "**/.env.*",
+        "**/.pytest_cache/",
+        "**/.venv/",
+        "**/__pycache__/",
+        "**/*.py[cod]",
+        "**/*.db",
+        "**/tests/",
     } <= patterns

@@ -23,8 +23,13 @@ def resolve_port(raw_port: str | None) -> int:
 def prepare_runtime(
     upload_dir: Path, uid: int = APP_UID, gid: int = APP_GID
 ) -> None:
+    euid = os.geteuid()
+    if euid != 0 and (
+        euid != uid or os.getegid() != gid or os.getgroups()
+    ):
+        raise RuntimeError("UPLOAD_DIR runtime identity is invalid")
     upload_dir.mkdir(parents=True, exist_ok=True)
-    if os.geteuid() == 0:
+    if euid == 0:
         os.chown(upload_dir, uid, gid)
         os.setgroups([])
         os.setgid(gid)

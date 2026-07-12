@@ -26,7 +26,7 @@ COPY alembic ./alembic
 COPY app ./app
 
 RUN mkdir -p /data/uploads \
-    && chown -R 10001:10001 /app /data/uploads
+    && chown 10001:10001 /data/uploads
 
 EXPOSE 8000
 
