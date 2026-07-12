@@ -4,6 +4,7 @@ import * as apiRoute from "../app/api/v1/[...path]/route";
 import { proxyApiRequest } from "./api-proxy";
 
 const PRIVATE_API_URL = "http://api.railway.internal:8000";
+const PUBLIC_DOMAIN = "web-production-1234.up.railway.app";
 const unavailablePayload = {
   code: "api_proxy_unavailable",
   message: "服务暂时不可用",
@@ -14,10 +15,12 @@ type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Respo
 
 afterEach(() => {
   delete process.env.API_INTERNAL_URL;
+  delete process.env.RAILWAY_PUBLIC_DOMAIN;
 });
 
 describe("proxyApiRequest", () => {
   it("fails safely when the private API target is missing", async () => {
+    process.env.RAILWAY_PUBLIC_DOMAIN = PUBLIC_DOMAIN;
     const upstream = vi.fn();
     vi.stubGlobal("fetch", upstream);
 
@@ -49,6 +52,7 @@ describe("proxyApiRequest", () => {
     "http://${{api.RAILWAY_PRIVATE_DOMAIN}}:8000",
   ])("rejects an unsafe private API target without fetching: %s", async (target) => {
     process.env.API_INTERNAL_URL = target;
+    process.env.RAILWAY_PUBLIC_DOMAIN = PUBLIC_DOMAIN;
     const upstream = vi.fn();
     vi.stubGlobal("fetch", upstream);
 
@@ -62,8 +66,76 @@ describe("proxyApiRequest", () => {
     expect(await response.json()).toEqual(unavailablePayload);
   });
 
+  it.each([
+    undefined,
+    "",
+    "WEB-PRODUCTION-1234.up.railway.app",
+    "web-production-1234.up.railway.app.",
+    " web-production-1234.up.railway.app",
+    "web-production-1234.up.railway.app ",
+    "https://web-production-1234.up.railway.app",
+    "user:pass@web-production-1234.up.railway.app",
+    "web-production-1234.up.railway.app/path",
+    "web-production-1234.up.railway.app?query=value",
+    "web-production-1234.up.railway.app#fragment",
+    "web-production-1234.up.railway.app:443",
+    "localhost",
+    "app.localhost",
+    "127.0.0.1",
+    "[::1]",
+    "single-label",
+    "-invalid.example.com",
+    "invalid-.example.com",
+    "invalid..example.com",
+    "invalid_name.example.com",
+  ])("rejects an unsafe Railway public domain without fetching: %s", async (domain) => {
+    process.env.API_INTERNAL_URL = PRIVATE_API_URL;
+    if (domain === undefined) {
+      delete process.env.RAILWAY_PUBLIC_DOMAIN;
+    } else {
+      process.env.RAILWAY_PUBLIC_DOMAIN = domain;
+    }
+    const upstream = vi.fn();
+    vi.stubGlobal("fetch", upstream);
+
+    const response = await proxyApiRequest(
+      new Request("http://0.0.0.0:3000/api/v1/auth/me"),
+      ["auth", "me"],
+    );
+
+    expect(upstream).not.toHaveBeenCalled();
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual(unavailablePayload);
+  });
+
+  it("trusts the Railway public domain instead of the listener or spoofed headers", async () => {
+    process.env.API_INTERNAL_URL = PRIVATE_API_URL;
+    process.env.RAILWAY_PUBLIC_DOMAIN = PUBLIC_DOMAIN;
+    const upstream = vi.fn<FetchLike>().mockResolvedValue(new Response(null));
+    vi.stubGlobal("fetch", upstream);
+
+    await proxyApiRequest(
+      new Request("http://0.0.0.0:3000/api/v1/auth/me?source=listener", {
+        headers: {
+          host: "attacker.example",
+          "x-forwarded-host": "spoofed.example",
+          "x-forwarded-proto": "http",
+        },
+      }),
+      ["auth", "me"],
+    );
+
+    const [target, init] = upstream.mock.calls[0];
+    const headers = new Headers(init?.headers);
+    expect(String(target)).toBe(`${PRIVATE_API_URL}/api/v1/auth/me?source=listener`);
+    expect(headers.get("host")).toBeNull();
+    expect(headers.get("x-forwarded-host")).toBe(PUBLIC_DOMAIN);
+    expect(headers.get("x-forwarded-proto")).toBe("https");
+  });
+
   it("streams the request and response while preserving end-to-end metadata", async () => {
     process.env.API_INTERNAL_URL = PRIVATE_API_URL;
+    process.env.RAILWAY_PUBLIC_DOMAIN = PUBLIC_DOMAIN;
     const firstCookie =
       "kaogong_session=token; Path=/; Expires=Wed, 21 Oct 2015 07:28:00 GMT; HttpOnly; Secure; SameSite=Lax";
     const secondCookie = "csrf=second; Path=/; Secure; SameSite=Lax";
@@ -144,7 +216,7 @@ describe("proxyApiRequest", () => {
     expect(requestHeaders.get("cookie")).toBe("existing=value");
     expect(requestHeaders.get("content-type")).toBe("application/json");
     expect(requestHeaders.get("x-keep-request")).toBe("public-request-value");
-    expect(requestHeaders.get("x-forwarded-host")).toBe("web.example:8443");
+    expect(requestHeaders.get("x-forwarded-host")).toBe(PUBLIC_DOMAIN);
     expect(requestHeaders.get("x-forwarded-proto")).toBe("https");
 
     const hopByHopHeaders = [
@@ -177,6 +249,7 @@ describe("proxyApiRequest", () => {
 
   it("encodes catch-all path segments and preserves the original query", async () => {
     process.env.API_INTERNAL_URL = PRIVATE_API_URL;
+    process.env.RAILWAY_PUBLIC_DOMAIN = PUBLIC_DOMAIN;
     const upstream = vi.fn(async () => new Response(null));
     vi.stubGlobal("fetch", upstream);
 
@@ -200,6 +273,7 @@ describe("proxyApiRequest", () => {
     "rejects unsafe catch-all path segments without fetching: %j",
     async (path) => {
       process.env.API_INTERNAL_URL = PRIVATE_API_URL;
+      process.env.RAILWAY_PUBLIC_DOMAIN = PUBLIC_DOMAIN;
       const upstream = vi.fn();
       vi.stubGlobal("fetch", upstream);
 
@@ -216,6 +290,7 @@ describe("proxyApiRequest", () => {
 
   it.each(["GET", "HEAD"])("does not attach a body to %s requests", async (method) => {
     process.env.API_INTERNAL_URL = PRIVATE_API_URL;
+    process.env.RAILWAY_PUBLIC_DOMAIN = PUBLIC_DOMAIN;
     const upstream = vi.fn<FetchLike>().mockResolvedValue(new Response(null));
     vi.stubGlobal("fetch", upstream);
     const request = new Request("https://web.example/api/v1/auth/me", { method });
@@ -230,6 +305,7 @@ describe("proxyApiRequest", () => {
 
   it("does not enable streaming mode for a request without a body", async () => {
     process.env.API_INTERNAL_URL = PRIVATE_API_URL;
+    process.env.RAILWAY_PUBLIC_DOMAIN = PUBLIC_DOMAIN;
     const upstream = vi.fn<FetchLike>().mockResolvedValue(new Response(null));
     vi.stubGlobal("fetch", upstream);
 
@@ -245,6 +321,7 @@ describe("proxyApiRequest", () => {
 
   it("returns a fixed response when the upstream fetch fails", async () => {
     process.env.API_INTERNAL_URL = PRIVATE_API_URL;
+    process.env.RAILWAY_PUBLIC_DOMAIN = PUBLIC_DOMAIN;
     const upstream = vi.fn(async () => {
       throw new Error(`connect failed for ${PRIVATE_API_URL}/secret-details`);
     });

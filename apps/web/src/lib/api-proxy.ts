@@ -1,4 +1,6 @@
 const PRIVATE_API_URL = "http://api.railway.internal:8000";
+const HOST_LABEL = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
+const LOCAL_HOSTNAME_SUFFIXES = new Set(["internal", "local", "localhost"]);
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -21,6 +23,34 @@ function safeUnavailable(): Response {
     { code: "api_proxy_unavailable", message: "服务暂时不可用" },
     { status: 503 },
   );
+}
+
+function railwayPublicDomain(): string | null {
+  const domain = process.env.RAILWAY_PUBLIC_DOMAIN;
+  if (!domain || domain.length > 253) return null;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(`https://${domain}`);
+  } catch {
+    return null;
+  }
+
+  const labels = domain.split(".");
+  const suffix = labels.at(-1);
+  if (
+    parsed.hostname !== domain ||
+    parsed.host !== domain ||
+    labels.length < 2 ||
+    labels.some((label) => label.length > 63 || !HOST_LABEL.test(label)) ||
+    !suffix ||
+    LOCAL_HOSTNAME_SUFFIXES.has(suffix) ||
+    (labels.length === 4 && labels.every((label) => /^\d+$/.test(label)))
+  ) {
+    return null;
+  }
+
+  return domain;
 }
 
 function blockedHeaderNames(headers: Headers): Set<string> {
@@ -56,7 +86,8 @@ export async function proxyApiRequest(
   request: Request,
   path: string[],
 ): Promise<Response> {
-  if (process.env.API_INTERNAL_URL !== PRIVATE_API_URL) {
+  const publicDomain = railwayPublicDomain();
+  if (process.env.API_INTERNAL_URL !== PRIVATE_API_URL || !publicDomain) {
     return safeUnavailable();
   }
   if (path.length === 0 || path.some((segment) => !segment || segment === "." || segment === "..")) {
@@ -75,8 +106,8 @@ export async function proxyApiRequest(
   }
 
   const headers = copyEndToEndHeaders(request.headers);
-  headers.set("x-forwarded-host", incoming.host);
-  headers.set("x-forwarded-proto", incoming.protocol.replace(":", ""));
+  headers.set("x-forwarded-host", publicDomain);
+  headers.set("x-forwarded-proto", "https");
 
   const hasBody = request.method !== "GET" && request.method !== "HEAD" && request.body !== null;
   const init: NodeRequestInit = {
