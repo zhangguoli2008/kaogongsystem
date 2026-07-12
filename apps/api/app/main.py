@@ -1,11 +1,14 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse
 
 from app.api.router import api_router
 from app.core.config import Settings, get_settings
 from app.core.database import create_session_factory
 from app.core.errors import UnexpectedErrorMiddleware, install_error_handlers
 from app.core.rate_limit import RateLimiter
+from app.core.readiness import ReadinessError, probe_readiness
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -23,6 +26,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # same bounded state without affecting authentication limits.
     app.state.provider_rate_limiter = RateLimiter(limit=10, window_seconds=60)
     app.add_middleware(UnexpectedErrorMiddleware)
+    if resolved.allowed_hosts != ["*"]:
+        app.add_middleware(
+            TrustedHostMiddleware,
+            allowed_hosts=resolved.allowed_hosts,
+        )
     # Added last so the configured CORS policy also wraps unexpected responses.
     app.add_middleware(
         CORSMiddleware,
@@ -37,6 +45,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok", "provider_mode": provider_mode}
+
+    @app.get("/ready")
+    async def ready(request: Request):
+        try:
+            await probe_readiness(
+                request.app.state.session_factory,
+                request.app.state.settings.upload_dir,
+            )
+        except ReadinessError:
+            return JSONResponse(status_code=503, content={"status": "not_ready"})
+        return {"status": "ready", "provider_mode": provider_mode}
 
     return app
 

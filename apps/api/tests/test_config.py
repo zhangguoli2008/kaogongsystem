@@ -132,7 +132,10 @@ def test_canonical_production_origin_matches_cors_exactly(tmp_path: Path) -> Non
     with TestClient(
         create_app(production_settings(tmp_path, allowed_origins=[origin]))
     ) as client:
-        response = client.get("/health", headers={"Origin": origin})
+        response = client.get(
+            "/health",
+            headers={"Origin": origin, "Host": "healthcheck.railway.app"},
+        )
 
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == origin
