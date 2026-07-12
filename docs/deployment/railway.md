@@ -143,6 +143,40 @@ if len(names) != len(set(names)) or sorted(names) != sorted(expected):
 PY
 }
 
+service_id() {
+  local expected_name=$1
+  python3 - "$run_tmp/services.json" "$expected_name" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    payload = json.load(source)
+if isinstance(payload, list):
+    items = payload
+elif isinstance(payload, dict):
+    items = payload.get("services", payload.get("serviceInstances"))
+    if items is None and isinstance(payload.get("environment"), dict):
+        items = payload["environment"].get("serviceInstances")
+    if isinstance(items, dict):
+        items = items.get("edges")
+else:
+    items = None
+if not isinstance(items, list):
+    raise SystemExit("STOP: unrecognized service-list JSON")
+matches = []
+for item in items:
+    node = item.get("node", item) if isinstance(item, dict) else None
+    if not isinstance(node, dict):
+        raise SystemExit("STOP: malformed service-list node")
+    name = node.get("name", node.get("serviceName"))
+    if name == sys.argv[2]:
+        matches.append(node.get("id", node.get("serviceId")))
+if len(matches) != 1 or not isinstance(matches[0], str) or not matches[0]:
+    raise SystemExit("STOP: expected one exact service ID")
+print(matches[0])
+PY
+}
+
 assert_domains() {
   local service=$1
   local expected_count=$2
@@ -202,8 +236,9 @@ PY
 assert_api_volume_count() {
   local expected_count=$1
   local snapshot="$run_tmp/api-volumes.json"
-  railway_cli volume --service api --environment production list --json \
-    >"$snapshot"
+  : "${API_SERVICE_ID:?Resolve the exact API service ID first}"
+  railway_cli volume --service "$API_SERVICE_ID" \
+    --environment production list --json >"$snapshot"
   python3 - "$snapshot" "$expected_count" <<'PY'
 import json
 import sys
@@ -275,12 +310,13 @@ WEB_URL=$(domain_origin web)
 printf 'API origin: %s\nWeb origin: %s\n' "$API_URL" "$WEB_URL"
 ```
 
-API 卷必须唯一且挂载到固定路径。CLI 5.26.0 的 `volume list --json` 返回环境中的全部卷，因此门禁按 `serviceName == "api"` 精确筛选，不对 Railway Postgres 模板自己的数据卷作假设。父命令上的服务/环境选择器是该版本的明确语法。
+API 卷必须唯一且挂载到固定路径。CLI 5.26.0 的 `volume list --json` 返回环境中的全部卷，因此门禁按 `serviceName == "api"` 精确筛选，不对 Railway Postgres 模板自己的数据卷作假设。该版本的 `volume --service` 直接消费服务 ID、不会可靠解析服务名称，所以必须先从刚通过门禁的服务快照中提取唯一 API ID；不得把 `api` 名称直接传给卷命令。
 
 ```bash
 assert_services Postgres api web
+API_SERVICE_ID=$(service_id api)
 assert_api_volume_count 0
-railway_cli volume --service api --environment production \
+railway_cli volume --service "$API_SERVICE_ID" --environment production \
   add --mount-path /data/uploads --json >"$run_tmp/add-api-volume.json"
 assert_api_volume_count 1
 
