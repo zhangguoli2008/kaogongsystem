@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set +x
 set -euo pipefail
 
 umask 077
@@ -118,22 +119,79 @@ state_written=0
 if [[ -n ${SMOKE_STATE_FILE:-} ]]; then
   state_file=$SMOKE_STATE_FILE
   [[ "$state_file" = /* ]] || die "SMOKE_STATE_FILE must be an absolute path"
-  [[ ! -L "$state_file" && ! -d "$state_file" ]] \
-    || die "SMOKE_STATE_FILE must not be a symlink or directory"
 else
   state_file=$(mktemp "${TMPDIR:-/tmp}/kaogong-smoke-state.XXXXXX")
   state_created=1
 fi
 
+state_file=$(python3 - "$state_file" <<'PY'
+import os
+import stat
+import sys
+
+path = os.path.abspath(sys.argv[1])
+if os.path.lexists(path) and stat.S_ISLNK(os.lstat(path).st_mode):
+    raise SystemExit("SMOKE_STATE_FILE must not be a symlink")
+parent = os.path.realpath(os.path.dirname(path))
+if not os.path.isdir(parent):
+    raise SystemExit("SMOKE_STATE_FILE parent must be a directory")
+print(os.path.join(parent, os.path.basename(path)))
+PY
+)
+
 state_tmp=""
+state_tmp_guard=""
+state_guard=""
 tmp_dir=""
+
+guarded_unlink() {
+  local path=$1
+  local guard=$2
+  python3 - "$path" "$guard" <<'PY'
+import os
+import stat
+import sys
+
+path, guard = sys.argv[1:]
+parent, name = os.path.dirname(path), os.path.basename(path)
+expected_parent_dev, expected_parent_ino, expected_dev, expected_ino = map(
+    int, guard.split(":")
+)
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+directory = os.open(parent, flags)
+try:
+    parent_status = os.fstat(directory)
+    if (parent_status.st_dev, parent_status.st_ino) != (
+        expected_parent_dev,
+        expected_parent_ino,
+    ):
+        raise SystemExit("guarded unlink parent changed")
+    status = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(status.st_mode)
+        or status.st_uid != os.geteuid()
+        or status.st_nlink != 1
+        or (status.st_dev, status.st_ino) != (expected_dev, expected_ino)
+    ):
+        raise SystemExit("guarded unlink target changed")
+    os.unlink(name, dir_fd=directory)
+finally:
+    os.close(directory)
+PY
+}
+
 cleanup() {
   local exit_code=$?
   trap - EXIT
-  [[ -n ${state_tmp:-} && -e ${state_tmp:-} ]] && rm -f -- "$state_tmp"
+  if [[ -n ${state_tmp:-} && -n ${state_tmp_guard:-} ]]; then
+    guarded_unlink "$state_tmp" "$state_tmp_guard" >/dev/null 2>&1 || true
+  fi
   [[ -n ${tmp_dir:-} && -d ${tmp_dir:-} ]] && rm -rf -- "$tmp_dir"
-  if [[ "$state_created" = 1 && "$state_written" = 0 ]]; then
-    rm -f -- "$state_file"
+  if [[ "$state_written" = 0 && -n ${state_tmp_guard:-} ]]; then
+    guarded_unlink "$state_file" "$state_tmp_guard" >/dev/null 2>&1 || true
+  fi
+  if [[ "$state_created" = 1 && "$state_written" = 0 && -n ${state_guard:-} ]]; then
+    guarded_unlink "$state_file" "$state_guard" >/dev/null 2>&1 || true
   fi
   exit "$exit_code"
 }
@@ -143,9 +201,96 @@ trap 'exit 130' HUP INT TERM
 state_dir=$(dirname "$state_file")
 state_name=$(basename "$state_file")
 [[ -d "$state_dir" && -w "$state_dir" ]] || die "SMOKE_STATE_FILE parent must be writable"
+read -r reserved_state state_guard < <(
+  python3 - "$state_dir" "$state_name" "$state_created" <<'PY'
+import os
+import stat
+import sys
+
+parent, name, created_hint = sys.argv[1:]
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+directory = os.open(parent, flags)
+try:
+    parent_status = os.fstat(directory)
+    try:
+        status = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        reserved = int(created_hint)
+    except FileNotFoundError:
+        descriptor = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory,
+        )
+        try:
+            status = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        reserved = 1
+    if (
+        not stat.S_ISREG(status.st_mode)
+        or status.st_uid != os.geteuid()
+        or status.st_nlink != 1
+        or status.st_size != 0
+        or stat.S_IMODE(status.st_mode) != 0o600
+    ):
+        raise SystemExit(
+            "SMOKE_STATE_FILE must be missing or an owned, empty, mode-0600 regular file"
+        )
+    guard = ":".join(
+        str(value)
+        for value in (
+            parent_status.st_dev,
+            parent_status.st_ino,
+            status.st_dev,
+            status.st_ino,
+        )
+    )
+    print(reserved, guard)
+finally:
+    os.close(directory)
+PY
+)
+state_created=$reserved_state
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/kaogong-production-smoke.XXXXXX")
 state_tmp=$(mktemp "$state_dir/.${state_name}.tmp.XXXXXX")
-chmod 600 "$state_tmp"
+state_tmp_guard=$(python3 - "$state_tmp" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+parent = os.path.dirname(path)
+directory = os.open(
+    parent,
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    parent_status = os.fstat(directory)
+    status = os.stat(os.path.basename(path), dir_fd=directory, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(status.st_mode)
+        or status.st_uid != os.geteuid()
+        or status.st_nlink != 1
+        or status.st_size != 0
+        or stat.S_IMODE(status.st_mode) != 0o600
+    ):
+        raise SystemExit("state temporary file is unsafe")
+    print(
+        ":".join(
+            str(value)
+            for value in (
+                parent_status.st_dev,
+                parent_status.st_ino,
+                status.st_dev,
+                status.st_ino,
+            )
+        )
+    )
+finally:
+    os.close(directory)
+PY
+)
 
 email=${SMOKE_EMAIL:-"codex-smoke-$(date +%s)-$$@example.com"}
 password=${SMOKE_PASSWORD:-}
@@ -227,6 +372,46 @@ if actual != expected:
 PY
 }
 
+assert_api_error() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import json
+import sys
+
+body_path, header_path, expected_code = sys.argv[1:]
+with open(body_path, encoding="utf-8") as source:
+    payload = json.load(source)
+if not isinstance(payload, dict) or set(payload) != {
+    "code",
+    "message",
+    "field_errors",
+    "request_id",
+}:
+    raise SystemExit("API error response shape mismatch")
+if payload["code"] != expected_code:
+    raise SystemExit("API error code mismatch")
+if not isinstance(payload["message"], str) or not payload["message"]:
+    raise SystemExit("API error message is missing")
+if payload["field_errors"] is not None:
+    raise SystemExit("unexpected API field errors")
+if not isinstance(payload["request_id"], str) or not payload["request_id"]:
+    raise SystemExit("API request ID is missing")
+
+headers = {}
+with open(header_path, encoding="iso-8859-1") as source:
+    for raw_line in source:
+        if ":" not in raw_line:
+            continue
+        name, value = raw_line.split(":", 1)
+        headers.setdefault(name.strip().lower(), []).append(value.strip())
+content_types = headers.get("content-type", [])
+if len(content_types) != 1 or not content_types[0].lower().startswith("application/json"):
+    raise SystemExit("API error content type mismatch")
+request_ids = headers.get("x-request-id", [])
+if request_ids != [payload["request_id"]]:
+    raise SystemExit("API request ID header mismatch")
+PY
+}
+
 json_field() {
   python3 - "$1" "$2" <<'PY'
 import json
@@ -305,15 +490,47 @@ http_request 201 "$tmp_dir/register-response.json" "$tmp_dir/register.headers" \
   --header 'Content-Type: application/json' \
   --data-binary "@$credentials_file" \
   "$api_proxy/auth/register"
-grep -Eqi '^set-cookie:[[:space:]]*kaogong_session=' "$tmp_dir/register.headers" \
-  || die "session cookie is missing"
-for attribute in 'Path=/' 'Max-Age=604800' 'HttpOnly' 'Secure' 'SameSite=lax'; do
-  grep -Fqi "$attribute" "$tmp_dir/register.headers" \
-    || die "session cookie attribute is missing"
-done
-if grep -Eqi '^set-cookie:.*;[[:space:]]*Domain=' "$tmp_dir/register.headers"; then
-  die "session cookie must remain host-only"
-fi
+python3 - "$tmp_dir/register.headers" <<'PY'
+import sys
+
+session_cookies = []
+with open(sys.argv[1], encoding="iso-8859-1") as source:
+    for raw_line in source:
+        if ":" not in raw_line:
+            continue
+        header, value = raw_line.split(":", 1)
+        if header.strip().lower() != "set-cookie":
+            continue
+        value = value.strip()
+        cookie_pair = value.split(";", 1)[0]
+        if "=" not in cookie_pair:
+            continue
+        name, _cookie_value = cookie_pair.split("=", 1)
+        if name.strip() == "kaogong_session":
+            session_cookies.append(value)
+if len(session_cookies) != 1:
+    raise SystemExit("expected exactly one session Set-Cookie header")
+
+parts = [part.strip() for part in session_cookies[0].split(";")]
+attributes = {}
+flags = set()
+for part in parts[1:]:
+    if "=" in part:
+        name, value = part.split("=", 1)
+        attributes[name.strip().lower()] = value.strip()
+    else:
+        flags.add(part.lower())
+if attributes.get("path") != "/":
+    raise SystemExit("session cookie Path mismatch")
+if attributes.get("max-age") != "604800":
+    raise SystemExit("session cookie Max-Age mismatch")
+if attributes.get("samesite", "").lower() != "lax":
+    raise SystemExit("session cookie SameSite mismatch")
+if "secure" not in flags or "httponly" not in flags:
+    raise SystemExit("session cookie security flags are missing")
+if "domain" in attributes:
+    raise SystemExit("session cookie must remain host-only")
+PY
 
 python3 - "$cookie_jar" "$web_url" <<'PY'
 import sys
@@ -333,8 +550,14 @@ with open(cookie_path, encoding="utf-8") as source:
         fields = line.split("\t")
         if len(fields) != 7 or fields[5] != "kaogong_session":
             continue
-        domain, _include_subdomains, path, secure, expires, _name, value = fields
-        if domain.lstrip(".") != expected_host or path != "/" or secure != "TRUE":
+        domain, include_subdomains, path, secure, expires, _name, value = fields
+        if (
+            domain != expected_host
+            or domain.startswith(".")
+            or include_subdomains != "FALSE"
+            or path != "/"
+            or secure != "TRUE"
+        ):
             raise SystemExit("session cookie is not first-party, secure, and root-scoped")
         if int(expires) <= int(time.time()) or not value:
             raise SystemExit("session cookie is empty or expired")
@@ -360,10 +583,14 @@ http_request 415 "$tmp_dir/wrong-mime.json" "$tmp_dir/wrong-mime.headers" \
   --cookie "$cookie_jar" \
   --form "file=@$wrong_file;type=text/plain" \
   "$api_proxy/uploads/questions"
+assert_api_error \
+  "$tmp_dir/wrong-mime.json" "$tmp_dir/wrong-mime.headers" unsupported_image_type
 http_request 413 "$tmp_dir/oversize.json" "$tmp_dir/oversize.headers" \
   --cookie "$cookie_jar" \
   --form "file=@$oversize_file;type=image/png" \
   "$api_proxy/uploads/questions"
+assert_api_error \
+  "$tmp_dir/oversize.json" "$tmp_dir/oversize.headers" upload_too_large
 
 http_request 201 "$tmp_dir/upload.json" "$tmp_dir/upload.headers" \
   --cookie "$cookie_jar" \
@@ -485,16 +712,28 @@ PY
 
 http_request 200 "$tmp_dir/review-history.json" "$tmp_dir/review-history.headers" \
   --cookie "$cookie_jar" "$api_proxy/reviews/questions/$question_id"
-python3 - "$tmp_dir/review-history.json" <<'PY'
+python3 - "$tmp_dir/review-history.json" "$question_id" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as source:
     payload = json.load(source)
-if payload.get("total", 0) < 1:
-    raise SystemExit("review history is empty")
-if not any(item.get("result_status") == "复习中" for item in payload.get("items", [])):
-    raise SystemExit("review history does not contain the submitted state")
+items = payload.get("items")
+if (
+    payload.get("page") != 1
+    or payload.get("page_size") != 20
+    or payload.get("total") != 1
+    or not isinstance(items, list)
+    or len(items) != 1
+):
+    raise SystemExit("review history count or pagination mismatch")
+item = items[0]
+if (
+    item.get("question_id") != sys.argv[2]
+    or item.get("result_status") != "复习中"
+    or item.get("review_note") != "Railway 正式环境 smoke"
+):
+    raise SystemExit("review history does not match the submitted review")
 PY
 
 http_request 200 "$tmp_dir/dashboard.json" "$tmp_dir/dashboard.headers" \
@@ -510,8 +749,26 @@ if payload.get("provider_mode") != "demo":
 if not any(item.get("id") == sys.argv[2] for item in payload.get("recent_questions", [])):
     raise SystemExit("dashboard recent questions omit the smoke question")
 today = payload.get("today_review") or {}
-if today.get("completed_count", 0) < 1:
-    raise SystemExit("dashboard review completion was not recorded")
+recent = payload.get("recent_questions")
+completed = today.get("completed")
+if (
+    payload.get("current_question") is not None
+    or not isinstance(recent, list)
+    or len(recent) != 1
+    or recent[0].get("id") != sys.argv[2]
+):
+    raise SystemExit("dashboard fresh-account question count mismatch")
+if (
+    today.get("daily_review_limit") != 20
+    or today.get("pending") != []
+    or today.get("completed_count") != 1
+    or today.get("total") != 1
+    or not isinstance(completed, list)
+    or len(completed) != 1
+    or completed[0].get("question_id") != sys.argv[2]
+    or completed[0].get("result_status") != "复习中"
+):
+    raise SystemExit("dashboard review completion count mismatch")
 PY
 
 http_request 200 "$tmp_dir/analytics.json" "$tmp_dir/analytics.headers" \
@@ -522,7 +779,7 @@ import sys
 
 with open(sys.argv[1], encoding="utf-8") as source:
     payload = json.load(source)
-if payload.get("total_questions", 0) < 1 or payload.get("is_demo") is not True:
+if payload.get("total_questions") != 1 or payload.get("is_demo") is not True:
     raise SystemExit("analytics summary mismatch")
 PY
 
@@ -547,14 +804,20 @@ http_request 201 "$tmp_dir/other-register.json" "$tmp_dir/other-register.headers
   "$api_proxy/auth/register"
 http_request 404 "$tmp_dir/question-isolation.json" "$tmp_dir/question-isolation.headers" \
   --cookie "$other_cookie_jar" "$api_proxy/questions/$question_id"
+assert_api_error \
+  "$tmp_dir/question-isolation.json" "$tmp_dir/question-isolation.headers" not_found
 http_request 404 "$tmp_dir/upload-isolation.json" "$tmp_dir/upload-isolation.headers" \
   --cookie "$other_cookie_jar" "$api_proxy/uploads/$upload_id"
+assert_api_error \
+  "$tmp_dir/upload-isolation.json" "$tmp_dir/upload-isolation.headers" not_found
 
 http_request 204 "$tmp_dir/logout.body" "$tmp_dir/logout.headers" \
   --request POST --cookie "$cookie_jar" --cookie-jar "$cookie_jar" \
   "$api_proxy/auth/logout"
 http_request 401 "$tmp_dir/logged-out-me.json" "$tmp_dir/logged-out-me.headers" \
   --cookie "$cookie_jar" "$api_proxy/auth/me"
+assert_api_error \
+  "$tmp_dir/logged-out-me.json" "$tmp_dir/logged-out-me.headers" invalid_session
 
 http_request 200 "$tmp_dir/login-response.json" "$tmp_dir/login-response.headers" \
   --cookie-jar "$cookie_jar" \
@@ -581,7 +844,8 @@ if question.get("analysis_status") != "已完成" or question.get("mastery_statu
     raise SystemExit("question state did not persist across login")
 if analysis.get("is_demo") is not True:
     raise SystemExit("analysis did not persist across login")
-if reviews.get("total", 0) < 1:
+items = reviews.get("items")
+if reviews.get("total") != 1 or not isinstance(items, list) or len(items) != 1:
     raise SystemExit("review history did not persist across login")
 PY
 
@@ -607,41 +871,122 @@ for directory, _subdirectories, filenames in os.walk(root):
             raise SystemExit("a response exposed an internal service or database URL")
 PY
 
-python3 - "$state_tmp" "$canonical_email" "$upload_id" "$question_id" <<'PY'
-import json
-import sys
-
-payload = {
-    "email": sys.argv[2],
-    "upload_id": sys.argv[3],
-    "question_id": sys.argv[4],
-}
-with open(sys.argv[1], "w", encoding="utf-8") as target:
-    json.dump(payload, target, ensure_ascii=False, sort_keys=True)
-    target.write("\n")
-PY
-chmod 600 "$state_tmp"
-mv -f -- "$state_tmp" "$state_file"
-state_tmp=""
-chmod 600 "$state_file"
-python3 - "$state_file" <<'PY'
+python3 - \
+  "$state_dir" "$state_name" "$(basename "$state_tmp")" \
+  "$state_guard" "$state_tmp_guard" \
+  "$canonical_email" "$upload_id" "$question_id" <<'PY'
 import json
 import os
 import stat
 import sys
 import uuid
 
-path = sys.argv[1]
-if stat.S_IMODE(os.lstat(path).st_mode) != 0o600 or os.path.islink(path):
-    raise SystemExit("state file mode or type is unsafe")
-with open(path, encoding="utf-8") as source:
-    payload = json.load(source)
-if set(payload) != {"email", "upload_id", "question_id"}:
-    raise SystemExit("state file contains unexpected fields")
+payload = {
+    "email": sys.argv[6],
+    "upload_id": sys.argv[7],
+    "question_id": sys.argv[8],
+}
 for key in ("upload_id", "question_id"):
     if str(uuid.UUID(payload[key])) != payload[key]:
         raise SystemExit(f"state file {key} is not a canonical UUID")
+
+parent, destination, temporary = sys.argv[1:4]
+destination_guard = tuple(map(int, sys.argv[4].split(":")))
+temporary_guard = tuple(map(int, sys.argv[5].split(":")))
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+directory = os.open(parent, flags)
+
+
+def checked_status(name: str, guard: tuple[int, int, int, int], *, empty: bool):
+    parent_status = os.fstat(directory)
+    if (parent_status.st_dev, parent_status.st_ino) != guard[:2]:
+        raise SystemExit("state file parent changed")
+    status = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(status.st_mode)
+        or status.st_uid != os.geteuid()
+        or status.st_nlink != 1
+        or stat.S_IMODE(status.st_mode) != 0o600
+        or (status.st_dev, status.st_ino) != guard[2:]
+        or (empty and status.st_size != 0)
+    ):
+        raise SystemExit("state file identity or permissions changed")
+    return status
+
+
+try:
+    checked_status(destination, destination_guard, empty=True)
+    checked_status(temporary, temporary_guard, empty=True)
+
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=directory,
+    )
+    try:
+        status = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_uid != os.geteuid()
+            or status.st_nlink != 1
+            or stat.S_IMODE(status.st_mode) != 0o600
+            or (status.st_dev, status.st_ino) != temporary_guard[2:]
+        ):
+            raise SystemExit("state temporary file changed before write")
+        os.ftruncate(descriptor, 0)
+        serialized = (
+            json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        view = memoryview(serialized)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise SystemExit("state file write was incomplete")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+    checked_status(temporary, temporary_guard, empty=False)
+    checked_status(destination, destination_guard, empty=True)
+    os.replace(
+        temporary,
+        destination,
+        src_dir_fd=directory,
+        dst_dir_fd=directory,
+    )
+    os.fsync(directory)
+
+    final_descriptor = os.open(
+        destination,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=directory,
+    )
+    try:
+        final_status = os.fstat(final_descriptor)
+        if (
+            not stat.S_ISREG(final_status.st_mode)
+            or final_status.st_uid != os.geteuid()
+            or final_status.st_nlink != 1
+            or stat.S_IMODE(final_status.st_mode) != 0o600
+            or (final_status.st_dev, final_status.st_ino) != temporary_guard[2:]
+        ):
+            raise SystemExit("published state file is unsafe")
+        with os.fdopen(os.dup(final_descriptor), encoding="utf-8") as source:
+            actual = json.load(source)
+    finally:
+        os.close(final_descriptor)
+
+    published = os.stat(destination, dir_fd=directory, follow_symlinks=False)
+    if (published.st_dev, published.st_ino) != temporary_guard[2:]:
+        raise SystemExit("published state file changed during validation")
+finally:
+    os.close(directory)
+
+if actual != payload or set(actual) != {"email", "upload_id", "question_id"}:
+    raise SystemExit("state file contains unexpected fields")
 PY
+state_tmp=""
 state_written=1
 
 printf 'production smoke passed; state=%s\n' "$state_file"

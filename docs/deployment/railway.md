@@ -19,11 +19,36 @@ CLI 5.26.0 不支持真正的 `rollback` 命令；`redeploy` 只会重发最新�
 
 ## 1. 固定 CLI、源码与 workspace
 
-在 Bash 或 Zsh 中定义可执行函数。不要使用包含空格的标量变量代替命令；Zsh 不会按预期拆分它。
+第 1～6 节以及后续的 API/Postgres 重启持久性检查必须在**同一个新开的 Bash 会话**中顺序执行；不要关闭终端、另开 shell 或只复制中间一段。退出这个 shell 会自动删除本地临时凭据，因此意外中断后必须从资源门禁重新检查，不能盲目重放创建命令。先进入仓库根目录并启动 Bash，再定义固定 CLI、临时目录和失败清理。不要使用包含空格的标量变量代替命令。
 
 ```bash
+set +x
 set -euo pipefail
 umask 077
+
+run_tmp=$(mktemp -d "${TMPDIR:-/tmp}/kaogong-railway-run.XXXXXX")
+project_list=""
+secret_file=""
+state_file=""
+
+cleanup_local_artifacts() {
+  if [[ -n ${run_tmp:-} && -d ${run_tmp:-} ]]; then
+    rm -rf -- "$run_tmp"
+  fi
+  unset SMOKE_PASSWORD
+}
+
+cleanup_on_exit() {
+  local exit_code=$?
+  trap - EXIT
+  cleanup_local_artifacts
+  exit "$exit_code"
+}
+
+trap cleanup_on_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 railway_cli() {
   npx -y @railway/cli@5.26.0 "$@"
@@ -46,7 +71,7 @@ railway_cli whoami
 列出现有项目仅用于检查名称，不要把输出复制进仓库或 QA 文档。若已经存在 `kaogong-ai-exam`，立即停止并让用户决定是否复用；不要再次执行 `init`。
 
 ```bash
-project_list=$(mktemp)
+project_list="$run_tmp/projects.json"
 railway_cli list --json >"$project_list"
 python3 - "$project_list" <<'PY'
 import json, sys
@@ -56,13 +81,14 @@ if any(item.get("name") == "kaogong-ai-exam" for item in items):
     raise SystemExit("STOP: project kaogong-ai-exam already exists")
 PY
 rm -f "$project_list"
+project_list=""
 ```
 
-从用户确认的 workspace 页面复制精确 ID 或名称，不要猜测：
+从用户确认的 workspace 页面复制精确 **ID**，不要使用可能重名的显示名称，也不要猜测：
 
 ```bash
-: "${RAILWAY_WORKSPACE:?Set the exact user-confirmed Railway workspace ID or name}"
-railway_cli init --name kaogong-ai-exam --workspace "$RAILWAY_WORKSPACE" --json
+: "${RAILWAY_WORKSPACE_ID:?Set the exact user-confirmed Railway workspace ID}"
+railway_cli init --name kaogong-ai-exam --workspace "$RAILWAY_WORKSPACE_ID" --json
 railway_cli status --environment production --json
 ```
 
@@ -70,48 +96,192 @@ railway_cli status --environment production --json
 
 ## 2. 创建并逐步检查资源
 
-新项目应没有服务。依次创建后，用服务列表确认名称；任何命令若报告资源已存在，停止而不是重试。
+先定义三个 fail-closed 门禁。无法识别 CLI JSON、资源数量/名称/端口/挂载路径不精确匹配时都会退出；不要修改脚本来“兼容”意外资源。
 
 ```bash
-railway_cli service list --environment production --json
+assert_services() {
+  local snapshot="$run_tmp/services.json"
+  railway_cli service list --environment production --json >"$snapshot"
+  python3 - "$snapshot" "$@" <<'PY'
+import json
+import sys
 
-railway_cli add --database postgres --json
-railway_cli service list --environment production --json
+with open(sys.argv[1], encoding="utf-8") as source:
+    payload = json.load(source)
+expected = list(sys.argv[2:])
+if isinstance(payload, list):
+    items = payload
+elif isinstance(payload, dict):
+    items = payload.get("services", payload.get("serviceInstances"))
+    if items is None and isinstance(payload.get("environment"), dict):
+        items = payload["environment"].get("serviceInstances")
+    if isinstance(items, dict):
+        items = items.get("edges")
+else:
+    items = None
+if not isinstance(items, list):
+    raise SystemExit("STOP: unrecognized service-list JSON")
+nodes = []
+for item in items:
+    if not isinstance(item, dict):
+        raise SystemExit("STOP: malformed service-list item")
+    node = item.get("node", item)
+    if not isinstance(node, dict):
+        raise SystemExit("STOP: malformed service-list node")
+    nodes.append(node)
+names = [
+    node.get("name") if node.get("name") is not None else node.get("serviceName")
+    for node in nodes
+]
+if any(not isinstance(name, str) or not name for name in names):
+    raise SystemExit("STOP: service without an exact name")
+if len(names) != len(set(names)) or sorted(names) != sorted(expected):
+    raise SystemExit(
+        f"STOP: expected services {sorted(expected)!r}, found {sorted(names)!r}"
+    )
+PY
+}
 
-railway_cli add --service api --json
-railway_cli service list --environment production --json
+assert_domains() {
+  local service=$1
+  local expected_count=$2
+  local expected_port=$3
+  local snapshot="$run_tmp/domains-$service.json"
+  railway_cli domain list \
+    --service "$service" --environment production --json >"$snapshot"
+  python3 - "$snapshot" "$expected_count" "$expected_port" <<'PY'
+import json
+import sys
 
-railway_cli add --service web --json
-railway_cli service list --environment production --json
+with open(sys.argv[1], encoding="utf-8") as source:
+    payload = json.load(source)
+if not isinstance(payload, dict) or not isinstance(payload.get("domains"), list):
+    raise SystemExit("STOP: unrecognized domain-list JSON")
+domains = payload["domains"]
+if any(not isinstance(domain, dict) for domain in domains):
+    raise SystemExit("STOP: malformed domain-list item")
+if any(domain.get("type") != "service" for domain in domains):
+    raise SystemExit("STOP: unexpected custom or unknown domain type")
+ids = [domain.get("id") for domain in domains]
+hosts = [domain.get("domain") for domain in domains]
+if (
+    any(not isinstance(value, str) or not value for value in ids + hosts)
+    or len(ids) != len(set(ids))
+    or len(hosts) != len(set(hosts))
+):
+    raise SystemExit("STOP: malformed or duplicate Railway domain")
+expected_count = int(sys.argv[2])
+expected_port = int(sys.argv[3])
+if len(domains) != expected_count:
+    raise SystemExit(
+        f"STOP: expected {expected_count} Railway domain(s), "
+        f"found {len(domains)}"
+    )
+if expected_count == 1:
+    domain = domains[0]
+    if domain.get("targetPort") != expected_port:
+        raise SystemExit("STOP: Railway domain or target port mismatch")
+PY
+}
+
+domain_origin() {
+  python3 - "$run_tmp/domains-$1.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    payload = json.load(source)
+domains = payload["domains"]
+if len(domains) != 1:
+    raise SystemExit("STOP: expected exactly one Railway domain")
+print(f"https://{domains[0]['domain']}")
+PY
+}
+
+assert_api_volume_count() {
+  local expected_count=$1
+  local snapshot="$run_tmp/api-volumes.json"
+  railway_cli volume --service api --environment production list --json \
+    >"$snapshot"
+  python3 - "$snapshot" "$expected_count" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    payload = json.load(source)
+if not isinstance(payload, dict) or not isinstance(payload.get("volumes"), list):
+    raise SystemExit("STOP: unrecognized volume-list JSON")
+items = payload["volumes"]
+for item in items:
+    if not isinstance(item, dict):
+        raise SystemExit("STOP: malformed volume-list item")
+ids = [item.get("id") for item in items]
+if any(not isinstance(value, str) or not value for value in ids):
+    raise SystemExit("STOP: malformed volume identity")
+if len(ids) != len(set(ids)):
+    raise SystemExit("STOP: duplicate volume identity")
+api_volumes = [item for item in items if item.get("serviceName") == "api"]
+expected_count = int(sys.argv[2])
+if len(api_volumes) != expected_count:
+    raise SystemExit(
+        f"STOP: expected {expected_count} API volume(s), found {len(api_volumes)}"
+    )
+if expected_count == 1:
+    volume = api_volumes[0]
+    if volume.get("mountPath") != "/data/uploads":
+        raise SystemExit("STOP: API volume mount path mismatch")
+    if volume.get("deletedAt") is not None or volume.get("isPendingDeletion") is True:
+        raise SystemExit("STOP: API volume is deleted or pending deletion")
+PY
+}
 ```
 
-确认服务恰好为 `Postgres`、`api`、`web` 后，再生成公网域名。先执行 `domain list`；新服务若已经有域名，停止。
+每次创建前后都断言精确拓扑。这样即使上一次命令已在远端成功但本地连接中断，重放也会在下一次 mutation 前停止。
 
 ```bash
-railway_cli domain list --service api --environment production --json
-railway_cli domain list --service web --environment production --json
+assert_services
+railway_cli add --database postgres --json >"$run_tmp/add-postgres.json"
+assert_services Postgres
 
-railway_cli domain --service api --environment production --port 8000 --json
-railway_cli domain --service web --environment production --port 3000 --json
+assert_services Postgres
+railway_cli add --service api --json >"$run_tmp/add-api.json"
+assert_services Postgres api
 
-railway_cli domain list --service api --environment production --json
-railway_cli domain list --service web --environment production --json
+assert_services Postgres api
+railway_cli add --service web --json >"$run_tmp/add-web.json"
+assert_services Postgres api web
 ```
 
-记下两个公开域名并在当前 shell 中设置为不带尾斜杠的 HTTPS origin；它们不是秘密，但不要把其他账户/项目输出写入仓库。
+服务名称精确匹配后，为 API 和 Web 分别创建一个 Railway 域名。域名创建也有独立的空列表前置门禁。
 
 ```bash
-API_URL='https://REPLACE_WITH_API_PUBLIC_DOMAIN'
-WEB_URL='https://REPLACE_WITH_WEB_PUBLIC_DOMAIN'
+assert_services Postgres api web
+assert_domains api 0 8000
+railway_cli domain \
+  --service api --environment production --port 8000 --json \
+  >"$run_tmp/create-api-domain.json"
+assert_domains api 1 8000
+
+assert_services Postgres api web
+assert_domains web 0 3000
+railway_cli domain \
+  --service web --environment production --port 3000 --json \
+  >"$run_tmp/create-web-domain.json"
+assert_domains web 1 3000
+
+API_URL=$(domain_origin api)
+WEB_URL=$(domain_origin web)
+printf 'API origin: %s\nWeb origin: %s\n' "$API_URL" "$WEB_URL"
 ```
 
-API 卷必须唯一且挂载到固定路径。先检查空列表，再创建并复查。父命令上的服务/环境选择器是 CLI 5.26.0 的明确语法。
+API 卷必须唯一且挂载到固定路径。CLI 5.26.0 的 `volume list --json` 返回环境中的全部卷，因此门禁按 `serviceName == "api"` 精确筛选，不对 Railway Postgres 模板自己的数据卷作假设。父命令上的服务/环境选择器是该版本的明确语法。
 
 ```bash
-railway_cli volume --service api --environment production list --json
+assert_services Postgres api web
+assert_api_volume_count 0
 railway_cli volume --service api --environment production \
-  add --mount-path /data/uploads --json
-railway_cli volume --service api --environment production list --json
+  add --mount-path /data/uploads --json >"$run_tmp/add-api-volume.json"
+assert_api_volume_count 1
 
 railway_cli service link api
 railway_cli status --environment production --json
@@ -119,11 +289,15 @@ railway_cli status --environment production --json
 
 ## 3. 安全设置变量
 
-变量设置全部使用 `--skip-deploys`，避免半配置状态触发部署。JWT 只通过 stdin 传入并丢弃标准输出：
+变量设置前再次断言完整拓扑，避免引用到拼写相近或意外创建的服务。全部设置使用 `--skip-deploys`，避免半配置状态触发部署。JWT 只通过 stdin 传入并丢弃标准输出：
 
 ```bash
 set +x
 set -o pipefail
+assert_services Postgres api web
+assert_domains api 1 8000
+assert_domains web 1 3000
+assert_api_volume_count 1
 openssl rand -hex 32 |
   railway_cli variable set JWT_SECRET --stdin \
     --service api --environment production --skip-deploys >/dev/null
@@ -212,29 +386,139 @@ curl --fail --silent --show-error --proto '=https' "$WEB_URL/health" |
 
 ## 5. 迁移、运行用户和卷检查
 
-迁移必须位于当前唯一 head，卷探针必须自删除，服务进程必须已经降权到 UID/GID 10001：
+先用可见的 `true` 命令完成 Railway 首次 SSH 密钥注册，避免注册提示被后续命令替换捕获。迁移必须精确位于当前唯一 head。随后从 `/proc` 找到实际的 `python -m app.entrypoint` 服务进程并检查其 UID/GID，而不是误把 Railway SSH 子进程当成应用进程。卷写入探针若由 root SSH 启动，会先清空附加组并显式降权到 UID/GID 10001；探针关闭、落盘并自删除后才算通过。
 
 ```bash
-railway_cli ssh --service api --environment production alembic current
+railway_cli ssh --service api --environment production true
 
-railway_cli ssh --service api --environment production python -c \
-  'import os, pathlib, tempfile; root=pathlib.Path("/data/uploads"); assert os.geteuid()==10001 and os.getegid()==10001; probe=tempfile.NamedTemporaryFile(dir=root, delete=True); probe.write(b"ok"); probe.flush(); print({"uid":os.geteuid(),"gid":os.getegid(),"mount":"/data/uploads","writable":True})'
+migration_current="$(
+  railway_cli ssh --service api --environment production alembic current
+)"
+test "$migration_current" = "0005_review_records (head)"
+printf 'alembic_revision=0005_review_records\n'
 
-railway_cli ssh --service api --environment production python -c \
-  'import http.client, os; check=lambda host: (lambda c: (c.request("GET","/health",headers={"Host":host}), c.getresponse())[1].status)(http.client.HTTPConnection("127.0.0.1",8000,timeout=5)); result={"unknown":check("evil.invalid"),"healthcheck":check("healthcheck.railway.app"),"private":check("api.railway.internal"),"public":check(os.environ["RAILWAY_PUBLIC_DOMAIN"])}; assert result=={"unknown":400,"healthcheck":200,"private":200,"public":200}; print(result)'
+railway_cli ssh --service api --environment production python - <<'PY'
+import json
+import os
+import pathlib
+import tempfile
+
+target = 10001
+matches = []
+for proc in pathlib.Path("/proc").iterdir():
+    if not proc.name.isdecimal():
+        continue
+    try:
+        argv = [
+            part.decode("utf-8", "surrogateescape")
+            for part in proc.joinpath("cmdline").read_bytes().split(b"\0")
+            if part
+        ]
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        continue
+    if argv[1:3] == ["-m", "app.entrypoint"]:
+        matches.append(proc)
+if len(matches) != 1:
+    raise SystemExit(
+        f"STOP: expected one app.entrypoint process, found {len(matches)}"
+    )
+
+status = {}
+for line in matches[0].joinpath("status").read_text(encoding="utf-8").splitlines():
+    key, separator, value = line.partition(":")
+    if separator:
+        status[key] = value.strip()
+uids = tuple(int(value) for value in status["Uid"].split())
+gids = tuple(int(value) for value in status["Gid"].split())
+groups = tuple(int(value) for value in status.get("Groups", "").split())
+if uids != (target, target, target, target):
+    raise SystemExit("STOP: serving process UID mismatch")
+if gids != (target, target, target, target):
+    raise SystemExit("STOP: serving process GID mismatch")
+if groups:
+    raise SystemExit("STOP: serving process has supplementary groups")
+
+if os.geteuid() == 0:
+    os.setgroups([])
+    os.setgid(target)
+    os.setuid(target)
+elif (
+    os.getuid() != target
+    or os.geteuid() != target
+    or os.getgid() != target
+    or os.getegid() != target
+    or os.getgroups()
+):
+    raise SystemExit("STOP: SSH probe cannot assume application identity")
+
+root = pathlib.Path("/data/uploads")
+if not root.is_dir() or not os.access(root, os.W_OK | os.X_OK):
+    raise SystemExit("STOP: upload mount is not writable by UID/GID 10001")
+descriptor, probe_path = tempfile.mkstemp(prefix=".railway-write-probe-", dir=root)
+try:
+    with os.fdopen(descriptor, "wb") as probe:
+        probe.write(b"ok")
+        probe.flush()
+        os.fsync(probe.fileno())
+finally:
+    try:
+        os.unlink(probe_path)
+    except FileNotFoundError:
+        pass
+if os.path.lexists(probe_path):
+    raise SystemExit("STOP: upload probe did not self-delete")
+print(json.dumps({
+    "app_uid": uids[1],
+    "app_gid": gids[1],
+    "probe_uid": os.geteuid(),
+    "probe_gid": os.getegid(),
+    "mount": "/data/uploads",
+    "writable": True,
+}, sort_keys=True))
+PY
+
+railway_cli ssh --service api --environment production python - <<'PY'
+import http.client
+import os
+
+
+def check(host):
+    connection = http.client.HTTPConnection("127.0.0.1", 8000, timeout=5)
+    try:
+        connection.request("GET", "/health", headers={"Host": host})
+        response = connection.getresponse()
+        response.read()
+        return response.status
+    finally:
+        connection.close()
+
+
+result = {
+    "unknown": check("evil.invalid"),
+    "healthcheck": check("healthcheck.railway.app"),
+    "private": check("api.railway.internal"),
+    "public": check(os.environ["RAILWAY_PUBLIC_DOMAIN"]),
+}
+expected = {"unknown": 400, "healthcheck": 200, "private": 200, "public": 200}
+if result != expected:
+    raise SystemExit(f"STOP: TrustedHost probe mismatch: {result!r}")
+print(result)
+PY
 ```
 
-`alembic current` 必须包含 `0005_review_records`。探针输出只能包含 UID/GID、固定挂载路径和布尔结果；Host 探针在容器回环接口验证未知 Host 为 400，healthcheck、私网和 API 公网 Host 为 200，避免 Railway 公网边缘路由掩盖应用中间件结果。任一检查失败都停止部署验收。
+UID/卷探针输出只能包含 UID/GID、固定挂载路径和布尔结果；Host 探针在容器回环接口验证未知 Host 为 400，healthcheck、私网和 API 公网 Host 为 200，避免 Railway 公网边缘路由掩盖应用中间件结果。任一检查失败都停止部署验收。
 
 ## 6. 自动 smoke 与重启前状态
 
-正式 smoke 通过 Web 同源代理执行，密码保存在 Git 之外的 0600 临时文件：
+正式 smoke 通过 Web 同源代理执行，密码和状态文件都放在本会话的受限临时目录内。shell 的 EXIT/信号 trap 会在失败或意外退出时删除它们：
 
 ```bash
-secret_file=$(mktemp)
+secret_file="$run_tmp/smoke-password"
+: >"$secret_file"
 chmod 600 "$secret_file"
 openssl rand -hex 24 >"$secret_file"
-state_file=$(mktemp)
+state_file="$run_tmp/smoke-state"
+: >"$state_file"
 chmod 600 "$state_file"
 
 SMOKE_PASSWORD=$(<"$secret_file") \
@@ -242,7 +526,18 @@ WEB_URL="$WEB_URL" API_URL="$API_URL" SMOKE_STATE_FILE="$state_file" \
   bash scripts/production-smoke.sh
 ```
 
-保留这两个临时文件仅用于后续 API/Postgres 重启持久性与 Chrome 验收；不要打印密码或 Cookie。`state_file` 只允许包含 smoke 邮箱、上传 UUID 和题目 UUID。
+不要退出当前 shell。保留这两个临时文件仅用于后续 API/Postgres 重启持久性与 Chrome 验收；不要打印密码或 Cookie。`state_file` 只允许包含 smoke 邮箱、上传 UUID 和题目 UUID。
+
+只有重启持久性和 Chrome 验收都结束后，才在同一 shell 执行以下最终清理；这会删除密码、smoke 状态和所有 CLI JSON 快照，并解除 trap：
+
+```bash
+cleanup_local_artifacts
+trap - EXIT HUP INT TERM
+run_tmp=""
+secret_file=""
+state_file=""
+printf 'local Railway QA credentials removed\n'
+```
 
 ## 7. 回滚与失败处理
 
