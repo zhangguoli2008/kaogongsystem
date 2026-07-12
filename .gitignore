@@ -27,6 +27,7 @@ out/
 coverage/
 .worktrees/
 .superpowers/
+.railway/
 *.db
 .data/
 uploads/

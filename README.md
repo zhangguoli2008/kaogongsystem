@@ -49,6 +49,7 @@ bash scripts/smoke.sh
 make dev       # 前台构建并启动全部服务
 make seed      # 写入或修复幂等演示数据
 make smoke     # 验证健康检查、登录页、演示登录与 Dashboard API
+make prod-smoke  # 验证已部署 Railway 正式环境的完整 API 闭环
 make migrate   # 手动执行 Alembic 迁移
 make test      # 后端测试 + 前端测试、lint、生产构建
 make down      # 停止本项目服务并保留数据卷
@@ -102,6 +103,12 @@ npm run build
 前后端默认统一使用 `localhost`。请始终通过 `http://localhost:3000` 打开 Web，不要改用 `127.0.0.1:3000`；Cookie 按主机名隔离，混用会表现为登录后仍被判定为未登录。API CORS 默认也只允许 `http://localhost:3000`。
 
 生产环境应至少完成以下配置：使用高强度随机 `JWT_SECRET`、启用 HTTPS、设置 `COOKIE_SECURE=true`、限制数据库端口暴露，并将允许来源调整为真实 Web 域名。
+
+## Railway 正式环境
+
+Railway 的创建、变量注入、CLI 直传、检查与回滚步骤见 [Railway 部署运行手册](docs/deployment/railway.md)。正式环境的浏览器请求始终使用 Web 同源 `/api/v1`，由 Next.js 在服务端通过 Railway 私网代理到 API；不要把 API 私网地址配置到浏览器端。
+
+完成部署后，在仓库根目录提供 `WEB_URL` 与 `API_URL` 即可运行 `make prod-smoke`。正式环境不得运行 `python -m app.seed`，也不得复制本地数据库或上传目录。
 
 ## 排错
 

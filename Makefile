@@ -1,4 +1,4 @@
-.PHONY: dev down migrate preflight seed smoke test
+.PHONY: dev down migrate preflight prod-smoke seed smoke test
 
 preflight:
 	bash scripts/dev-preflight.sh
@@ -17,6 +17,9 @@ seed:
 
 smoke:
 	bash scripts/smoke.sh
+
+prod-smoke:
+	bash scripts/production-smoke.sh
 
 test:
 	cd apps/api && uv run pytest -q
