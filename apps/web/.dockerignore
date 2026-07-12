@@ -6,3 +6,29 @@ node_modules
 .env
 .env.*
 !.env.example
+
+# Recursive dependency, build, test, and cache artifacts
+**/node_modules/
+**/.next/
+**/coverage/
+**/.cache/
+**/.npm/
+**/.turbo/
+**/dist/
+**/build/
+**/test-results/
+**/playwright-report/
+**/*.log
+**/*.tsbuildinfo
+
+# Recursive local secrets and credentials
+**/.env
+**/.env.*
+!**/.env.example
+**/.npmrc
+**/*.key
+**/*.pem
+
+# Local editor and packaged artifacts
+**/.DS_Store
+**/*.tgz
