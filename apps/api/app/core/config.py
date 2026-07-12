@@ -27,13 +27,19 @@ def _is_loopback_host(host: str) -> bool:
 def _is_valid_production_origin(origin: str) -> bool:
     try:
         parsed = urlsplit(origin)
-        _ = parsed.port
+        port = parsed.port
     except ValueError:
         return False
+    hostname = parsed.hostname
+    if hostname is None:
+        return False
+    canonical_host = f"[{hostname}]" if ":" in hostname else hostname
+    canonical_port = "" if port in {None, 443} else f":{port}"
+    canonical_origin = f"https://{canonical_host}{canonical_port}"
     return (
-        parsed.scheme == "https"
-        and parsed.hostname is not None
-        and not _is_loopback_host(parsed.hostname)
+        origin == canonical_origin
+        and parsed.scheme == "https"
+        and not _is_loopback_host(hostname)
         and parsed.username is None
         and parsed.password is None
         and parsed.path in {"", "/"}

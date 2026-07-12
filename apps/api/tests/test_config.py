@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
 from app.core.config import Settings
 from app.core.database import create_session_factory, normalize_database_url
@@ -108,6 +109,33 @@ def test_production_configuration_rejects_non_origin_urls(
 ) -> None:
     with pytest.raises(ValueError, match="ALLOWED_ORIGINS"):
         create_app(production_settings(tmp_path, allowed_origins=[origin]))
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://example.com/",
+        "HTTPS://EXAMPLE.COM",
+        "https://example.com:443",
+    ],
+)
+def test_production_configuration_rejects_noncanonical_browser_origins(
+    tmp_path: Path, origin: str
+) -> None:
+    with pytest.raises(ValueError, match="ALLOWED_ORIGINS"):
+        create_app(production_settings(tmp_path, allowed_origins=[origin]))
+
+
+def test_canonical_production_origin_matches_cors_exactly(tmp_path: Path) -> None:
+    origin = "https://example.com"
+
+    with TestClient(
+        create_app(production_settings(tmp_path, allowed_origins=[origin]))
+    ) as client:
+        response = client.get("/health", headers={"Origin": origin})
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == origin
 
 
 @pytest.mark.parametrize(
