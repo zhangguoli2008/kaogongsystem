@@ -1,6 +1,6 @@
 "use client";
 
-import { CalendarDays, Menu } from "lucide-react";
+import { CalendarDays, LogOut, Menu } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import type { User } from "@/types/api";
@@ -8,9 +8,11 @@ import type { User } from "@/types/api";
 interface AppHeaderProps {
   user: User;
   onOpenNavigation: () => void;
+  onLogout: () => void;
+  logoutPending: boolean;
 }
 
-export function AppHeader({ user, onOpenNavigation }: AppHeaderProps) {
+export function AppHeader({ user, onOpenNavigation, onLogout, logoutPending }: AppHeaderProps) {
   const date = new Intl.DateTimeFormat("zh-CN", {
     year: "numeric",
     month: "2-digit",
@@ -42,6 +44,16 @@ export function AppHeader({ user, onOpenNavigation }: AppHeaderProps) {
             {user.email.slice(0, 1).toUpperCase()}
           </span>
         </div>
+        <Button
+          variant="ghost"
+          size="sm"
+          aria-label={logoutPending ? "正在退出…" : "退出登录"}
+          disabled={logoutPending}
+          onClick={onLogout}
+        >
+          <LogOut className="size-4" aria-hidden="true" />
+          <span className="hidden sm:inline">{logoutPending ? "正在退出…" : "退出登录"}</span>
+        </Button>
       </div>
     </header>
   );
