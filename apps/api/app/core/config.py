@@ -1,3 +1,4 @@
+import re
 from functools import lru_cache
 from ipaddress import ip_address
 from pathlib import Path
@@ -52,6 +53,7 @@ class Settings(BaseSettings):
     app_env: AppEnvironment = "development"
     database_url: str = DEFAULT_DATABASE_URL
     jwt_secret: str = DEFAULT_JWT_SECRET
+    internal_proxy_secret: str | None = None
     provider_mode: Literal["auto", "live", "demo"] = "auto"
     openai_api_key: str | None = None
     openai_model: str = "gpt-5.5"
@@ -78,6 +80,12 @@ class Settings(BaseSettings):
         errors: list[str] = []
         if len(self.jwt_secret.encode("utf-8")) < 32 or self.jwt_secret == DEFAULT_JWT_SECRET:
             errors.append("JWT_SECRET must be a non-default value of at least 32 bytes")
+        if self.internal_proxy_secret is None or not re.fullmatch(
+            r"[0-9a-f]{64}", self.internal_proxy_secret
+        ):
+            errors.append(
+                "INTERNAL_PROXY_SECRET must be a 64-character lowercase hex value"
+            )
         if not self.cookie_secure:
             errors.append("COOKIE_SECURE must be true")
         if self.provider_mode == "auto":

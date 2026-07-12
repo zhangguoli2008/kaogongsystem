@@ -168,6 +168,122 @@ def test_auth_rate_limit_allows_ten_attempts_per_ip(client):
     assert response.json()["code"] == "auth_rate_limit_exceeded"
 
 
+def test_auth_rate_limit_uses_railway_real_client_ip(client):
+    client.app.state.auth_rate_limiter = RateLimiter(limit=1, window_seconds=60)
+    client.app.state.settings.internal_proxy_secret = "b" * 64
+    payload = {"email": "missing@example.com", "password": "strong-pass-123"}
+    first_headers = {
+        "X-Kaogong-Proxy-Secret": "b" * 64,
+        "X-Railway-Edge": "railway/asia-southeast1-eqsg3a",
+        "X-Real-IP": "192.0.2.10",
+    }
+    second_headers = {
+        "X-Kaogong-Proxy-Secret": "b" * 64,
+        "X-Railway-Edge": "railway/asia-southeast1-eqsg3a",
+        "X-Real-IP": "192.0.2.11",
+    }
+
+    first = client.post("/api/v1/auth/login", json=payload, headers=first_headers)
+    second = client.post("/api/v1/auth/login", json=payload, headers=second_headers)
+    repeated = client.post("/api/v1/auth/login", json=payload, headers=first_headers)
+
+    assert first.status_code == 401
+    assert second.status_code == 401
+    assert repeated.status_code == 429
+
+
+def test_auth_rate_limit_does_not_trust_real_ip_without_railway_edge(client):
+    client.app.state.auth_rate_limiter = RateLimiter(limit=1, window_seconds=60)
+    client.app.state.settings.internal_proxy_secret = "b" * 64
+    payload = {"email": "missing@example.com", "password": "strong-pass-123"}
+
+    first = client.post(
+        "/api/v1/auth/login", json=payload, headers={"X-Real-IP": "192.0.2.10"}
+    )
+    repeated = client.post(
+        "/api/v1/auth/login", json=payload, headers={"X-Real-IP": "192.0.2.11"}
+    )
+
+    assert first.status_code == 401
+    assert repeated.status_code == 429
+
+
+def test_auth_rate_limit_falls_back_to_socket_key_for_malformed_real_ip(client):
+    client.app.state.auth_rate_limiter = RateLimiter(limit=1, window_seconds=60)
+    client.app.state.settings.internal_proxy_secret = "b" * 64
+    payload = {"email": "missing@example.com", "password": "strong-pass-123"}
+
+    first = client.post(
+        "/api/v1/auth/login",
+        json=payload,
+        headers={
+            "X-Kaogong-Proxy-Secret": "b" * 64,
+            "X-Railway-Edge": "railway/asia-southeast1-eqsg3a",
+            "X-Real-IP": "spoofed, 192.0.2.10",
+        },
+    )
+    repeated = client.post(
+        "/api/v1/auth/login",
+        json=payload,
+        headers={
+            "X-Kaogong-Proxy-Secret": "b" * 64,
+            "X-Railway-Edge": "railway/asia-southeast1-eqsg3a",
+            "X-Real-IP": "another-spoof",
+        },
+    )
+
+    assert first.status_code == 401
+    assert repeated.status_code == 429
+
+
+def test_auth_rate_limit_does_not_trust_real_ip_with_wrong_proxy_secret(client):
+    client.app.state.auth_rate_limiter = RateLimiter(limit=1, window_seconds=60)
+    client.app.state.settings.internal_proxy_secret = "b" * 64
+    payload = {"email": "missing@example.com", "password": "strong-pass-123"}
+    common = {
+        "X-Kaogong-Proxy-Secret": "c" * 64,
+        "X-Railway-Edge": "railway/asia-southeast1-eqsg3a",
+    }
+
+    first = client.post(
+        "/api/v1/auth/login",
+        json=payload,
+        headers={**common, "X-Real-IP": "192.0.2.10"},
+    )
+    repeated = client.post(
+        "/api/v1/auth/login",
+        json=payload,
+        headers={**common, "X-Real-IP": "192.0.2.11"},
+    )
+
+    assert first.status_code == 401
+    assert repeated.status_code == 429
+
+
+def test_auth_rate_limit_falls_back_for_invalid_configured_proxy_secret(client):
+    client.app.state.auth_rate_limiter = RateLimiter(limit=1, window_seconds=60)
+    client.app.state.settings.internal_proxy_secret = "é" * 64
+    payload = {"email": "missing@example.com", "password": "strong-pass-123"}
+    common = {
+        "X-Kaogong-Proxy-Secret": "b" * 64,
+        "X-Railway-Edge": "railway/asia-southeast1-eqsg3a",
+    }
+
+    first = client.post(
+        "/api/v1/auth/login",
+        json=payload,
+        headers={**common, "X-Real-IP": "192.0.2.10"},
+    )
+    repeated = client.post(
+        "/api/v1/auth/login",
+        json=payload,
+        headers={**common, "X-Real-IP": "192.0.2.11"},
+    )
+
+    assert first.status_code == 401
+    assert repeated.status_code == 429
+
+
 def test_validation_errors_use_standard_error_shape(client):
     response = client.post(
         "/api/v1/auth/register",

@@ -1,10 +1,15 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as apiRoute from "../app/api/v1/[...path]/route";
 import { proxyApiRequest } from "./api-proxy";
 
 const PRIVATE_API_URL = "http://api.railway.internal:8000";
 const PUBLIC_DOMAIN = "web-production-1234.up.railway.app";
+const INTERNAL_PROXY_SECRET = "a".repeat(64);
+const DEEPLY_ENCODED_PRIVATE_HOST = Array.from({ length: 6 }).reduce<string>(
+  (value) => value.replaceAll("%", "%25"),
+  "%61pi%2Erailway%2Einternal",
+);
 const unavailablePayload = {
   code: "api_proxy_unavailable",
   message: "服务暂时不可用",
@@ -13,8 +18,13 @@ const unavailablePayload = {
 type NodeRequestInit = RequestInit & { duplex?: "half" };
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
+beforeEach(() => {
+  process.env.INTERNAL_PROXY_SECRET = INTERNAL_PROXY_SECRET;
+});
+
 afterEach(() => {
   delete process.env.API_INTERNAL_URL;
+  delete process.env.INTERNAL_PROXY_SECRET;
   delete process.env.RAILWAY_PUBLIC_DOMAIN;
 });
 
@@ -108,6 +118,38 @@ describe("proxyApiRequest", () => {
     expect(await response.json()).toEqual(unavailablePayload);
   });
 
+  it.each([
+    undefined,
+    "",
+    "short",
+    "A".repeat(64),
+    "G".repeat(64),
+    "a".repeat(63),
+    `${"a".repeat(64)}\n`,
+  ])(
+    "rejects a missing or malformed internal proxy secret: %s",
+    async (secret) => {
+      process.env.API_INTERNAL_URL = PRIVATE_API_URL;
+      process.env.RAILWAY_PUBLIC_DOMAIN = PUBLIC_DOMAIN;
+      if (secret === undefined) {
+        delete process.env.INTERNAL_PROXY_SECRET;
+      } else {
+        process.env.INTERNAL_PROXY_SECRET = secret;
+      }
+      const upstream = vi.fn();
+      vi.stubGlobal("fetch", upstream);
+
+      const response = await proxyApiRequest(
+        new Request("https://web.example/api/v1/auth/me"),
+        ["auth", "me"],
+      );
+
+      expect(upstream).not.toHaveBeenCalled();
+      expect(response.status).toBe(503);
+      expect(await response.json()).toEqual(unavailablePayload);
+    },
+  );
+
   it("trusts the Railway public domain instead of the listener or spoofed headers", async () => {
     process.env.API_INTERNAL_URL = PRIVATE_API_URL;
     process.env.RAILWAY_PUBLIC_DOMAIN = PUBLIC_DOMAIN;
@@ -120,6 +162,9 @@ describe("proxyApiRequest", () => {
           host: "attacker.example",
           "x-forwarded-host": "spoofed.example",
           "x-forwarded-proto": "http",
+          "x-railway-edge": "railway/asia-southeast1-eqsg3a",
+          "x-real-ip": "203.0.113.42",
+          "x-kaogong-proxy-secret": "attacker-controlled",
         },
       }),
       ["auth", "me"],
@@ -131,6 +176,105 @@ describe("proxyApiRequest", () => {
     expect(headers.get("host")).toBeNull();
     expect(headers.get("x-forwarded-host")).toBe(PUBLIC_DOMAIN);
     expect(headers.get("x-forwarded-proto")).toBe("https");
+    expect(headers.get("x-railway-edge")).toBe(
+      "railway/asia-southeast1-eqsg3a",
+    );
+    expect(headers.get("x-real-ip")).toBe("203.0.113.42");
+    expect(headers.get("x-kaogong-proxy-secret")).toBe(INTERNAL_PROXY_SECRET);
+  });
+
+  it("drops an invalid Railway client-IP header before private forwarding", async () => {
+    process.env.API_INTERNAL_URL = PRIVATE_API_URL;
+    process.env.RAILWAY_PUBLIC_DOMAIN = PUBLIC_DOMAIN;
+    const upstream = vi.fn<FetchLike>().mockResolvedValue(new Response(null));
+    vi.stubGlobal("fetch", upstream);
+
+    await proxyApiRequest(
+      new Request("https://web.example/api/v1/auth/me", {
+        headers: { "x-real-ip": "spoofed, 203.0.113.42" },
+      }),
+      ["auth", "me"],
+    );
+
+    const headers = new Headers(upstream.mock.calls[0][1]?.headers);
+    expect(headers.get("x-real-ip")).toBeNull();
+  });
+
+  it.each([
+    "http://api.railway.internal:8000/api/v1/questions?source=slash",
+    "http://api.railway.internal/api/v1/questions?source=slash",
+    "/api/v1/questions?source=slash",
+  ])("rewrites a safe upstream redirect to the Web origin: %s", async (location) => {
+    process.env.API_INTERNAL_URL = PRIVATE_API_URL;
+    process.env.RAILWAY_PUBLIC_DOMAIN = PUBLIC_DOMAIN;
+    const upstream = vi.fn<FetchLike>().mockResolvedValue(
+      new Response(null, {
+        status: 307,
+        headers: { location },
+      }),
+    );
+    vi.stubGlobal("fetch", upstream);
+
+    const response = await proxyApiRequest(
+      new Request("https://web.example/api/v1/questions/"),
+      ["questions"],
+    );
+
+    expect(response.status).toBe(307);
+    expect(response.headers.get("location")).toBe(
+      "/api/v1/questions?source=slash",
+    );
+  });
+
+  it("preserves an encoded literal percent in a safe API redirect", async () => {
+    process.env.API_INTERNAL_URL = PRIVATE_API_URL;
+    process.env.RAILWAY_PUBLIC_DOMAIN = PUBLIC_DOMAIN;
+    const location = "/api/v1/questions?discount=10%25";
+    const upstream = vi.fn<FetchLike>().mockResolvedValue(
+      new Response(null, {
+        status: 307,
+        headers: { location },
+      }),
+    );
+    vi.stubGlobal("fetch", upstream);
+
+    const response = await proxyApiRequest(
+      new Request("https://web.example/api/v1/questions/"),
+      ["questions"],
+    );
+
+    expect(response.status).toBe(307);
+    expect(response.headers.get("location")).toBe(location);
+  });
+
+  it.each([
+    "https://evil.example/steal",
+    "//evil.example/steal",
+    "http://api.railway.internal:8000/private",
+    "http://api.railway.internal:8000/api/v1/questions?next=api.railway.internal",
+    "http://api.railway.internal:8000/api/v1/questions#api.railway.internal",
+    "http://api.railway.internal:8000/api/v1/questions?next=api%2Erailway%2Einternal",
+    "http://api.railway.internal:8000/api/v1/questions?next=%2561pi%252Erailway%252Einternal",
+    `http://api.railway.internal:8000/api/v1/questions?next=${DEEPLY_ENCODED_PRIVATE_HOST}`,
+  ])("fails closed for an unsafe upstream redirect: %s", async (location) => {
+    process.env.API_INTERNAL_URL = PRIVATE_API_URL;
+    process.env.RAILWAY_PUBLIC_DOMAIN = PUBLIC_DOMAIN;
+    const upstream = vi.fn<FetchLike>().mockResolvedValue(
+      new Response(null, {
+        status: 307,
+        headers: { location },
+      }),
+    );
+    vi.stubGlobal("fetch", upstream);
+
+    const response = await proxyApiRequest(
+      new Request("https://web.example/api/v1/questions/"),
+      ["questions"],
+    );
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("location")).toBeNull();
+    expect(await response.json()).toEqual(unavailablePayload);
   });
 
   it("streams the request and response while preserving end-to-end metadata", async () => {
@@ -154,6 +298,7 @@ describe("proxyApiRequest", () => {
       upgrade: "websocket",
       "x-remove-response": "private-response-value",
       "x-request-id": "request-1",
+      "x-kaogong-proxy-secret": "must-not-leak",
     });
     upstreamHeaders.append("set-cookie", firstCookie);
     upstreamHeaders.append("set-cookie", secondCookie);
@@ -238,6 +383,7 @@ describe("proxyApiRequest", () => {
     }
     expect(requestHeaders.get("x-remove-request")).toBeNull();
     expect(response.headers.get("x-remove-response")).toBeNull();
+    expect(response.headers.get("x-kaogong-proxy-secret")).toBeNull();
 
     expect(response.status).toBe(418);
     expect(response.statusText).toBe("Upstream teapot");

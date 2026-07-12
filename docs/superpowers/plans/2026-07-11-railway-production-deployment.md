@@ -75,6 +75,7 @@ def production_settings(tmp_path: Path, **overrides: object) -> Settings:
         "app_env": "production",
         "database_url": "postgresql://user:pass@postgres.railway.internal:5432/kaogong",
         "jwt_secret": "a" * 64,
+        "internal_proxy_secret": "b" * 64,
         "provider_mode": "demo",
         "openai_api_key": None,
         "upload_dir": Path("/data/uploads"),
@@ -99,6 +100,8 @@ def test_explicit_demo_production_configuration_is_accepted(tmp_path: Path) -> N
     ("overrides", "message"),
     [
         ({"jwt_secret": "short"}, "JWT_SECRET"),
+        ({"internal_proxy_secret": None}, "INTERNAL_PROXY_SECRET"),
+        ({"internal_proxy_secret": "short"}, "INTERNAL_PROXY_SECRET"),
         ({"cookie_secure": False}, "COOKIE_SECURE"),
         ({"provider_mode": "auto"}, "PROVIDER_MODE"),
         ({"openai_api_key": "must-not-be-stored"}, "OPENAI_API_KEY"),
@@ -154,6 +157,7 @@ Expected: collection/import fails because `normalize_database_url` does not exis
 In `apps/api/app/core/config.py`:
 
 ```python
+import re
 from urllib.parse import urlsplit
 
 from sqlalchemy.engine import make_url
@@ -167,6 +171,7 @@ class Settings(BaseSettings):
     app_env: AppEnvironment = "development"
     database_url: str = DEFAULT_DATABASE_URL
     jwt_secret: str = DEFAULT_JWT_SECRET
+    internal_proxy_secret: str | None = None
     provider_mode: Literal["auto", "live", "demo"] = "auto"
     openai_api_key: str | None = None
     openai_model: str = "gpt-5.5"
@@ -185,6 +190,10 @@ class Settings(BaseSettings):
         errors: list[str] = []
         if len(self.jwt_secret.encode("utf-8")) < 32 or self.jwt_secret == DEFAULT_JWT_SECRET:
             errors.append("JWT_SECRET must be a non-default value of at least 32 bytes")
+        if self.internal_proxy_secret is None or not re.fullmatch(
+            r"[0-9a-f]{64}", self.internal_proxy_secret
+        ):
+            errors.append("INTERNAL_PROXY_SECRET must be a 64-character lowercase hex value")
         if not self.cookie_secure:
             errors.append("COOKIE_SECURE must be true")
         if self.provider_mode == "auto":
@@ -624,7 +633,7 @@ tests
 *.db
 ```
 
-Update the approved spec to state the already-approved corrections: `railway up apps/api --path-as-root`, the API manifest, `PORT=8000`, and the Web same-origin proxy.
+Update the approved spec to state the already-approved corrections: `railway up apps/api --path-as-root --service api --environment production`, the API manifest, `PORT=8000`, and the Web same-origin proxy.
 
 - [ ] **Step 4: Verify tests, manifest syntax, and image build**
 
@@ -661,9 +670,18 @@ git commit -m "feat: prepare API container for Railway"
 
 **Interfaces:**
 - Produces: `proxyApiRequest(request: Request, path: string[]) -> Promise<Response>`.
-- Consumes: server-only `API_INTERNAL_URL`, exactly `http://api.railway.internal:8000` or its Railway reference-variable equivalent.
+- Consumes: server-only `API_INTERNAL_URL`, exactly `http://api.railway.internal:8000` or its Railway reference-variable equivalent, plus an exact 64-character lowercase-hex `INTERNAL_PROXY_SECRET` shared only with API.
 - Browser contract: `NEXT_PUBLIC_API_URL=/api/v1`; cookies are first-party on the Web host.
-- Proxy contract: preserve method, query, Cookie, Content-Type, streamed body, upstream status, response body, `Set-Cookie`, and `X-Request-ID`; strip `Host`, `Content-Length`, and hop-by-hop headers.
+- Proxy contract: preserve method, query, Cookie, Content-Type, streamed body,
+  upstream status, response body, `Set-Cookie`, and `X-Request-ID`; strip
+  `Host`, `Content-Length`, and hop-by-hop headers. Strip any inbound private
+  proxy-secret header, overwrite it from server runtime configuration, and
+  never expose it in the response. Validate Railway-owned `X-Real-IP` before
+  the private hop so API auth throttling remains per client.
+  Rewrite same-API redirect `Location` values to relative Web-origin
+  `/api/v1/*` paths and fail closed for external or non-API redirects, including
+  raw or repeatedly encoded private hostnames in query/fragment data; never
+  expose `railway.internal` to the browser.
 
 - [ ] **Step 1: Write failing proxy and health tests**
 
@@ -1017,6 +1035,10 @@ state_file=${SMOKE_STATE_FILE:-$(mktemp)}
 email=${SMOKE_EMAIL:-"codex-smoke-$(date +%s)-$$@example.com"}
 password=${SMOKE_PASSWORD:-"smoke-$(openssl rand -hex 16)"}
 tmp_dir=$(mktemp -d)
+password_file="$tmp_dir/password"
+printf '%s' "$password" >"$password_file"
+chmod 600 "$password_file"
+unset password
 cookie_jar="$tmp_dir/cookies"
 other_cookie_jar="$tmp_dir/other-cookies"
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -1065,9 +1087,11 @@ if grep -Fqi 'access-control-allow-origin:' "$tmp_dir/rejected-origin.headers"; 
   exit 1
 fi
 
-python3 - "$tmp_dir/register.json" "$email" "$password" <<'PY'
+python3 - "$tmp_dir/register.json" "$email" "$password_file" <<'PY'
 import json, sys
-json.dump({"email": sys.argv[2], "password": sys.argv[3]}, open(sys.argv[1], "w", encoding="utf-8"))
+with open(sys.argv[3], encoding="utf-8") as source:
+    password = source.read()
+json.dump({"email": sys.argv[2], "password": password}, open(sys.argv[1], "w", encoding="utf-8"))
 PY
 status=$(curl --silent --show-error --write-out '%{http_code}' \
   --dump-header "$tmp_dir/register.headers" --output "$tmp_dir/register-response.json" \
@@ -1135,9 +1159,11 @@ curl --fail --silent --show-error --cookie "$cookie_jar" "$api_proxy/analytics/s
 assert_json "$tmp_dir/analytics.json" 'payload["total_questions"] >= 1 and payload["is_demo"] is True'
 
 other_email="other-$(date +%s)-$$@example.com"
-python3 - "$tmp_dir/other-register.json" "$other_email" "$password" <<'PY'
+python3 - "$tmp_dir/other-register.json" "$other_email" "$password_file" <<'PY'
 import json, sys
-json.dump({"email": sys.argv[2], "password": sys.argv[3]}, open(sys.argv[1], "w", encoding="utf-8"))
+with open(sys.argv[3], encoding="utf-8") as source:
+    password = source.read()
+json.dump({"email": sys.argv[2], "password": password}, open(sys.argv[1], "w", encoding="utf-8"))
 PY
 curl --fail --silent --show-error --cookie-jar "$other_cookie_jar" \
   --header 'Content-Type: application/json' --data-binary @"$tmp_dir/other-register.json" \
@@ -1184,55 +1210,12 @@ Add a short README section that points to `docs/deployment/railway.md`, states t
 
 - [ ] **Step 3: Write the exact Railway runbook**
 
-Create `docs/deployment/railway.md` with these ordered command groups and stop conditions:
-
-```bash
-RAILWAY='npx -y @railway/cli@5.26.0'
-$RAILWAY login
-$RAILWAY whoami
-$RAILWAY init --name kaogong-ai-exam --json
-$RAILWAY add --database postgres --json
-$RAILWAY add --service api --json
-$RAILWAY add --service web --json
-$RAILWAY domain --service api --port 8000 --json
-$RAILWAY domain --service web --port 3000 --json
-$RAILWAY service link api
-$RAILWAY volume add --mount-path /data/uploads --json
-```
-
-Set variables without triggering partial deployments:
-
-```bash
-openssl rand -hex 32 | $RAILWAY variable set JWT_SECRET --stdin --service api --environment production --skip-deploys
-$RAILWAY variable set --service api --environment production --skip-deploys \
-  APP_ENV=production \
-  'DATABASE_URL=${{Postgres.DATABASE_URL}}' \
-  COOKIE_SECURE=true \
-  'ALLOWED_ORIGINS=["https://${{web.RAILWAY_PUBLIC_DOMAIN}}"]' \
-  'ALLOWED_HOSTS=["${{api.RAILWAY_PUBLIC_DOMAIN}}","api.railway.internal","healthcheck.railway.app"]' \
-  PROVIDER_MODE=demo \
-  UPLOAD_DIR=/data/uploads \
-  MAX_UPLOAD_BYTES=10485760 \
-  PORT=8000 \
-  RAILWAY_RUN_UID=0
-$RAILWAY variable set --service web --environment production --skip-deploys \
-  NEXT_PUBLIC_API_URL=/api/v1 \
-  'API_INTERNAL_URL=http://${{api.RAILWAY_PRIVATE_DOMAIN}}:8000' \
-  PORT=3000
-```
-
-Deploy the exact app subdirectories:
-
-```bash
-$RAILWAY up apps/api --path-as-root --service api --environment production --message "deploy api $(git rev-parse --short HEAD)"
-$RAILWAY up apps/web --path-as-root --service web --environment production --message "deploy web $(git rev-parse --short HEAD)"
-```
+Create `docs/deployment/railway.md` with ordered, fail-closed command groups and stop conditions. Its sections 1–4 are the only executable source of truth for workspace selection, resource creation, shared-secret injection and deployment; do not duplicate abbreviated Railway commands in this plan because omitted workspace, service, environment, trap or stdout controls would make them unsafe to replay.
 
 The runbook must also include:
 
-- Verify `railway status --json`, `railway deployment list --service api --limit 1 --json`, and the Web equivalent.
-- Inspect only bounded logs with `railway logs --service api --lines 100` and Web equivalent; do not dump variables.
-- Verify `railway ssh --service api alembic current` reports `0005_review_records`.
+- Verify status, latest deployment and bounded logs with the exact service and `--environment production` commands in runbook section 4; do not abbreviate them or dump variables.
+- Verify Alembic revision and runtime/volume/Host contracts with the exact `--service api --environment production` SSH commands in runbook section 5.
 - Verify volume UID/write with a remote temporary probe that deletes itself.
 - Stop if Railway asks for payment/upgrade, names an existing project/resource, migration fails, or `/ready` is not 200.
 - Roll back application code with the previous Railway deployment; do not run destructive Alembic downgrade or delete database/volume.
@@ -1373,7 +1356,7 @@ Expected: the CLI identifies the user's Railway account. Pause for the user only
 
 - [ ] **Step 2: Create and inspect resources using the runbook**
 
-Execute the `init`, database, API, Web, domain, service-link, and volume commands from `docs/deployment/railway.md`. After every mutation, inspect JSON output and `railway status --json`; do not re-run a create command if the resource already exists.
+Execute the `init`, database, API, Web, domain, service-link, and volume commands from `docs/deployment/railway.md`. After every mutation, inspect JSON output and run the exact production-scoped status/resource gate from runbook section 2; do not re-run a create command if the resource already exists.
 
 Expected: exactly three services and one API upload volume in one production environment.
 
@@ -1384,8 +1367,8 @@ Execute the runbook's stdin secret command and reference-variable commands. Chec
 Expected keys:
 
 ```text
-api: APP_ENV DATABASE_URL JWT_SECRET COOKIE_SECURE ALLOWED_ORIGINS ALLOWED_HOSTS PROVIDER_MODE UPLOAD_DIR MAX_UPLOAD_BYTES PORT RAILWAY_RUN_UID
-web: NEXT_PUBLIC_API_URL API_INTERNAL_URL PORT
+api: APP_ENV DATABASE_URL JWT_SECRET INTERNAL_PROXY_SECRET COOKIE_SECURE ALLOWED_ORIGINS ALLOWED_HOSTS PROVIDER_MODE UPLOAD_DIR MAX_UPLOAD_BYTES PORT RAILWAY_RUN_UID
+web: NEXT_PUBLIC_API_URL API_INTERNAL_URL INTERNAL_PROXY_SECRET PORT
 ```
 
 Confirm `OPENAI_API_KEY` is absent.
@@ -1404,14 +1387,17 @@ Expected:
 
 - [ ] **Step 5: Verify public/private service contracts**
 
-Run:
+Execute section 5 of `docs/deployment/railway.md` exactly in the same persistent
+shell. Do not replace it with a `railway ssh ... python -c` child-UID check:
+Railway SSH may start that child as root even though the serving process has
+correctly dropped privileges. The runbook first warms up SSH visibly, asserts
+the exact Alembic head, finds the real `python -m app.entrypoint` process in
+`/proc`, verifies all of its UID/GID values are `10001`, then explicitly drops
+the write probe to `10001:10001` before fsync and self-deletion.
 
-```bash
-npx -y @railway/cli@5.26.0 ssh --service api alembic current
-npx -y @railway/cli@5.26.0 ssh --service api python -c 'import os, pathlib, tempfile; root=pathlib.Path("/data/uploads"); f=tempfile.NamedTemporaryFile(dir=root, delete=True); f.write(b"ok"); f.flush(); print({"uid": os.geteuid(), "mount": str(root), "writable": True})'
-```
-
-Expected: revision `0005_review_records`, runtime UID `10001`, mount `/data/uploads`, and successful self-deleting probe.
+Expected: revision exactly `0005_review_records (head)`, the actual serving
+process and write probe both use UID/GID `10001`, mount `/data/uploads` is
+writable, the probe deletes itself, and the loopback TrustedHost matrix matches.
 
 ---
 
@@ -1427,17 +1413,7 @@ Expected: revision `0005_review_records`, runtime UID `10001`, mount `/data/uplo
 
 - [ ] **Step 1: Run production smoke through the Web origin**
 
-Generate a password without printing it, then run:
-
-```bash
-secret_file=$(mktemp)
-chmod 600 "$secret_file"
-openssl rand -hex 24 >"$secret_file"
-state_file=$(mktemp)
-SMOKE_PASSWORD=$(<"$secret_file") \
-WEB_URL="$WEB_URL" API_URL="$API_URL" SMOKE_STATE_FILE="$state_file" \
-bash scripts/production-smoke.sh
-```
+Execute section 6 of `docs/deployment/railway.md` exactly in the same persistent shell. It creates newline-free password material and the guarded smoke state inside the trap-managed `run_tmp`; do not replace those paths with standalone `mktemp` files or print either value.
 
 Expected: script reports pass and the state file contains only email, upload ID, and question ID. Keep the password file only until restart and Chrome validation finish.
 
@@ -1453,58 +1429,9 @@ Verify directly:
 
 - [ ] **Step 3: Restart API and PostgreSQL, then prove persistence**
 
-Capture IDs from the state file without printing the password. Restart API and Postgres one at a time:
+Execute section 6.1 of `docs/deployment/railway.md` exactly in the same persistent shell. It must restart API first, wait for exact `/ready`, and complete a fresh-login persistence check before issuing the PostgreSQL restart. After PostgreSQL restarts, it must wait for readiness again and repeat the same persistence check. Do not issue both restart commands back-to-back or continue after either gate fails.
 
-```bash
-npx -y @railway/cli@5.26.0 service restart --service api --yes --json
-npx -y @railway/cli@5.26.0 service restart --service Postgres --yes --json
-```
-
-Wait for API `/ready` to return 200, then run the exact persistence checks through the Web origin:
-
-```bash
-for _ in $(seq 1 60); do
-  curl --fail --silent --show-error "$API_URL/ready" >/dev/null 2>&1 && break
-  sleep 2
-done
-curl --fail --silent --show-error "$API_URL/ready" | grep -q '"status":"ready"'
-
-email=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["email"])' "$state_file")
-question_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["question_id"])' "$state_file")
-upload_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["upload_id"])' "$state_file")
-cookie_jar=$(mktemp)
-login_body=$(mktemp)
-python3 - "$login_body" "$email" "$(<"$secret_file")" <<'PY'
-import json, sys
-json.dump({"email": sys.argv[2], "password": sys.argv[3]}, open(sys.argv[1], "w", encoding="utf-8"))
-PY
-curl --fail --silent --show-error --cookie-jar "$cookie_jar" \
-  --header 'Content-Type: application/json' --data-binary @"$login_body" \
-  "$WEB_URL/api/v1/auth/login" >/dev/null
-curl --fail --silent --show-error --cookie "$cookie_jar" \
-  "$WEB_URL/api/v1/questions/$question_id" >"$login_body.question"
-python3 - "$login_body.question" <<'PY'
-import json, sys
-payload = json.load(open(sys.argv[1], encoding="utf-8"))
-assert payload["analysis_status"] == "已完成"
-assert payload["mastery_status"] == "复习中"
-assert payload["current_analysis"]["is_demo"] is True
-PY
-curl --fail --silent --show-error --cookie "$cookie_jar" \
-  "$WEB_URL/api/v1/reviews/questions/$question_id" >"$login_body.reviews"
-python3 - "$login_body.reviews" <<'PY'
-import json, sys
-payload = json.load(open(sys.argv[1], encoding="utf-8"))
-assert payload["total"] >= 1
-assert any(item["result_status"] == "复习中" for item in payload["items"])
-PY
-curl --fail --silent --show-error --cookie "$cookie_jar" \
-  "$WEB_URL/api/v1/uploads/$upload_id" >"$login_body.image"
-test -s "$login_body.image"
-rm -f "$cookie_jar" "$login_body" "$login_body.question" "$login_body.reviews" "$login_body.image"
-```
-
-Expected: account, question, current analysis, review record, mastery state, and original image all remain available.
+Expected: both checkpoints prove the account, question, current analysis, single review record, mastery state, and original uploaded image remain available; each downloaded image is byte-for-byte equal to the original fixture.
 
 - [ ] **Step 4: Load the Chrome control skill and run the full user journey**
 

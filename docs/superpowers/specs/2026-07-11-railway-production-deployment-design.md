@@ -30,8 +30,8 @@
 
 从当前工作区根目录分别向 Web 与 API 服务执行：
 
-- API：`railway up apps/api --path-as-root`
-- Web：`railway up apps/web --path-as-root --service web`
+- API：`railway up apps/api --path-as-root --service api --environment production`
+- Web：`railway up apps/web --path-as-root --service web --environment production`
 
 `--path-as-root` 让每个现有 Dockerfile 继续使用自己的应用目录作为构建上下文，避免改变已经通过本地验证的 `COPY` 边界。每个应用目录内新增独立的 `railway.json`，固定 Dockerfile builder、单副本、健康检查和 API 的迁移/卷要求。
 
@@ -65,10 +65,10 @@ flowchart LR
 - 由现有 Next.js standalone 镜像运行。
 - 监听 Railway 注入的 `PORT`。
 - 浏览器 API 基址固定为同源 `/api/v1`。
-- Catch-all Route Handler 将所有 `/api/v1/*` 方法、请求体和必要请求头流式转发到 `API_INTERNAL_URL`，并保留状态码、响应体、`Set-Cookie` 与请求 ID；不得把私网地址暴露给浏览器。
+- Catch-all Route Handler 将所有 `/api/v1/*` 方法、请求体和必要请求头流式转发到 `API_INTERNAL_URL`，并保留状态码、响应体、`Set-Cookie` 与请求 ID；删除浏览器提供的私网共享密钥头并覆写为 Web/API 共用的运行时密钥，校验并转发 Railway 提供的 `X-Real-IP`，让认证限流继续按真实客户端隔离；将同一 API 的重定向改写为 Web 同源相对路径，对外部、越界或在查询/片段中包含原始/编码私网主机名的重定向 fail closed；任何响应都不得把私网地址或共享密钥暴露给浏览器。
 - 代理删除客户端 `Host` 与 hop-by-hop headers，让服务端请求使用 API 私网主机名。
 - 健康检查使用根页面或专用轻量端点，必须返回 HTTP 200。
-- Web 不持有数据库、JWT 或第三方 Provider 密钥。
+- Web 不持有数据库、JWT 或第三方 Provider 密钥；只持有用途单一、与 API 一致的私网代理共享密钥。
 
 ### 3.2 API 服务
 
@@ -98,6 +98,7 @@ flowchart LR
 | `APP_ENV` | 固定为 `production` |
 | `DATABASE_URL` | 引用 Railway PostgreSQL 私网连接串，并使用项目已安装的 `psycopg` 驱动 |
 | `JWT_SECRET` | 由安全随机源生成，至少 32 字节，不得使用开发默认值 |
+| `INTERNAL_PROXY_SECRET` | 与 Web 相同的 64 位小写十六进制随机值；只通过 stdin 注入，不记录或回传 |
 | `COOKIE_SECURE` | 固定为 `true` |
 | `ALLOWED_ORIGINS` | 只包含实际 Web HTTPS 地址 |
 | `ALLOWED_HOSTS` | API 公网主机名、`api.railway.internal` 与 `healthcheck.railway.app` |
@@ -107,7 +108,7 @@ flowchart LR
 | `MAX_UPLOAD_BYTES` | 保持 10 MiB 业务上限 |
 | `PORT` | 固定为 `8000`，同时用于公网健康检查与私网代理 |
 
-生产启动验证必须拒绝以下配置：开发默认 JWT、非 HTTPS/localhost Origin、`COOKIE_SECURE=false`、`PROVIDER_MODE=auto`、本地数据库默认地址，或缺失的上传目录配置。
+生产启动验证必须拒绝以下配置：开发默认 JWT、缺失或格式错误的私网代理共享密钥、非 HTTPS/localhost Origin、`COOKIE_SECURE=false`、`PROVIDER_MODE=auto`、本地数据库默认地址，或缺失的上传目录配置。
 
 ### 4.2 Web 必需配置
 
@@ -115,6 +116,7 @@ flowchart LR
 | --- | --- |
 | `NEXT_PUBLIC_API_URL` | 固定为同源相对路径 `/api/v1` |
 | `API_INTERNAL_URL` | `http://${{api.RAILWAY_PRIVATE_DOMAIN}}:8000`，仅服务端可见 |
+| `INTERNAL_PROXY_SECRET` | 与 API 相同的 64 位小写十六进制随机值；仅服务端代理读取 |
 | `PORT` | 由 Railway 注入，容器必须使用该值 |
 
 ## 5. 迁移、启动与持久化
@@ -125,7 +127,7 @@ flowchart LR
 2. 创建 PostgreSQL、API、Web 三个服务。
 3. 为 API 创建 `/data/uploads` 持久化卷并配置单副本。
 4. 生成 API 与 Web 的 Railway HTTPS 域名；API 公网域名仅用于运维健康检查和直接 smoke。
-5. 注入变量和强随机 JWT 密钥。
+5. 注入变量、强随机 JWT 密钥，以及一次生成并分别通过 stdin 注入 Web/API 的私网代理共享密钥。
 6. 先发布 API 镜像；Pre-Deploy Command 执行 `alembic upgrade head`。
 7. `/ready` 返回 200 后允许 API 切流。
 8. 使用 `NEXT_PUBLIC_API_URL=/api/v1` 与 API 私网地址发布 Web，并先验证代理健康和 Cookie 往返。
@@ -146,12 +148,13 @@ flowchart LR
 - 卷不会在构建或 Pre-Deploy 阶段使用。
 - 启动时确保目录存在且运行用户可写。
 - `/ready` 使用创建并删除临时探针文件验证写权限，不读取或覆盖用户文件。
-- 初次验收后重启 API，再验证原上传图片仍可读取。
+- 初次验收后先重启 API，等待 readiness 并验证完整状态与原上传图片逐字节一致；再重启 PostgreSQL，重新等待 readiness 并重复同一验证。
 
 ## 6. 安全边界
 
 - 认证 Cookie 必须包含 `Secure`、`HttpOnly` 与 `SameSite=Lax`；经 Web 同源代理返回后，Cookie 归属于 Web 主机。
 - 浏览器不直接跨站调用 API。API 的 CORS 仍只允许最终 Web Origin，作为直接运维请求和错误配置的纵深防护；任意其他 Origin 不应获得允许头。
+- API 只有在私网共享密钥恒定时间比对、Railway 边缘标记和合法 `X-Real-IP` 同时成立时才信任真实客户端 IP；否则认证限流回退到连接地址。
 - API 接受 Railway 的健康检查 Host，同时拒绝未授权的用户数据访问。
 - 正式环境不创建或重置 `demo@example.com` 公共账号。
 - 测试账号使用本次随机生成的唯一邮箱和强密码；密码不提交到 Git。
@@ -172,7 +175,7 @@ flowchart LR
 ### 7.2 远程 smoke
 
 - Web 首页、Web `/health`、API `/health` 与 `/ready` 返回预期状态。
-- Web `/api/v1/*` 代理可以转发 JSON、multipart 上传、Cookie、非 2xx 响应和 `Set-Cookie`，响应中不暴露 `API_INTERNAL_URL`。
+- Web `/api/v1/*` 代理可以转发 JSON、multipart 上传、Cookie、非 2xx 响应和 `Set-Cookie`，响应中不暴露 `API_INTERNAL_URL`、`railway.internal` 或共享密钥头。
 - CORS 预检只允许最终 Web Origin；浏览器用户流程的网络请求全部保持 Web 同源。
 - 注册、登录、当前用户、退出与重新登录正常。
 - 登录响应 Cookie 具备生产安全属性。
@@ -192,7 +195,7 @@ flowchart LR
 6. 完成一次今日复习并更新掌握状态。
 7. 核对 Dashboard 和统计页数据变化。
 8. 退出、重新登录并确认数据仍在。
-9. 重启 API 与 PostgreSQL，刷新页面并确认账号、题目、分析、复习记录和图片均持久化。
+9. 逐个重启 API 与 PostgreSQL，每次都先等待 readiness，再刷新页面并确认账号、题目、分析、复习记录和图片均持久化且图片逐字节一致。
 10. 检查桌面与窄屏主流程无明显布局、焦点或可读性回归。
 
 ### 7.4 失败与停止条件

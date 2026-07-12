@@ -579,6 +579,47 @@ if payload.get("email") != sys.argv[2]:
     raise SystemExit("authenticated email mismatch")
 PY
 
+redirect_status=$(curl "${curl_common[@]}" \
+  --path-as-is \
+  --dump-header "$tmp_dir/proxy-redirect.headers" \
+  --output "$tmp_dir/proxy-redirect.body" \
+  --write-out '%{http_code}' \
+  --cookie "$cookie_jar" \
+  "$api_proxy/questions/") || die "proxy redirect transport failed"
+case "$redirect_status" in
+  307|308) ;;
+  *) die "proxy trailing-slash redirect did not return HTTP 307 or 308" ;;
+esac
+python3 - "$tmp_dir/proxy-redirect.headers" "$web_url" <<'PY'
+import sys
+from urllib.parse import urljoin, urlsplit
+
+headers = []
+with open(sys.argv[1], encoding="iso-8859-1") as source:
+    for raw_line in source:
+        if ":" not in raw_line:
+            continue
+        name, value = raw_line.split(":", 1)
+        if name.strip().lower() == "location":
+            headers.append(value.strip())
+if len(headers) != 1:
+    raise SystemExit("expected exactly one proxy redirect Location")
+location = headers[0]
+resolved = urlsplit(urljoin(sys.argv[2] + "/", location))
+expected = urlsplit(sys.argv[2])
+if (
+    resolved.scheme != "https"
+    or resolved.hostname != expected.hostname
+    or resolved.port is not None
+    or resolved.username
+    or resolved.password
+    or resolved.path != "/api/v1/questions"
+    or resolved.query
+    or resolved.fragment
+):
+    raise SystemExit("proxy redirect escaped the public Web API origin")
+PY
+
 http_request 415 "$tmp_dir/wrong-mime.json" "$tmp_dir/wrong-mime.headers" \
   --cookie "$cookie_jar" \
   --form "file=@$wrong_file;type=text/plain" \

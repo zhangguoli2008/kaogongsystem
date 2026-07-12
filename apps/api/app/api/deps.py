@@ -1,3 +1,6 @@
+import re
+import secrets
+from ipaddress import ip_address
 from typing import Annotated
 
 import jwt
@@ -11,8 +14,31 @@ from app.core.security import ALGORITHM, SESSION_COOKIE
 from app.models.user import User
 
 
+RAILWAY_EDGE_PATTERN = re.compile(r"railway/[a-z0-9-]+")
+PROXY_SECRET_PATTERN = re.compile(r"[0-9a-f]{64}")
+
+
 async def enforce_auth_rate_limit(request: Request) -> None:
     client_ip = request.client.host if request.client else "unknown"
+    railway_client_ip = request.headers.get("X-Real-IP")
+    railway_edge = request.headers.get("X-Railway-Edge")
+    proxy_secret = request.headers.get("X-Kaogong-Proxy-Secret")
+    configured_proxy_secret = request.app.state.settings.internal_proxy_secret
+    if (
+        configured_proxy_secret is not None
+        and PROXY_SECRET_PATTERN.fullmatch(configured_proxy_secret)
+        and proxy_secret is not None
+        and PROXY_SECRET_PATTERN.fullmatch(proxy_secret)
+        and secrets.compare_digest(proxy_secret, configured_proxy_secret)
+        and railway_client_ip
+        and "%" not in railway_client_ip
+        and railway_edge
+        and RAILWAY_EDGE_PATTERN.fullmatch(railway_edge)
+    ):
+        try:
+            client_ip = ip_address(railway_client_ip).compressed
+        except ValueError:
+            pass
     if not request.app.state.auth_rate_limiter.allow(client_ip):
         raise APIError(
             status_code=429,

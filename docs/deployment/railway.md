@@ -28,6 +28,7 @@ umask 077
 
 run_tmp=$(mktemp -d "${TMPDIR:-/tmp}/kaogong-railway-run.XXXXXX")
 project_list=""
+proxy_secret_file=""
 secret_file=""
 state_file=""
 
@@ -289,7 +290,7 @@ railway_cli status --environment production --json
 
 ## 3. 安全设置变量
 
-变量设置前再次断言完整拓扑，避免引用到拼写相近或意外创建的服务。全部设置使用 `--skip-deploys`，避免半配置状态触发部署。JWT 只通过 stdin 传入并丢弃标准输出：
+变量设置前再次断言完整拓扑，避免引用到拼写相近或意外创建的服务。全部设置使用 `--skip-deploys`，避免半配置状态触发部署。JWT 与 Web→API 私网共享密钥只通过 stdin 传入并丢弃标准输出；共享密钥只生成一次并分别注入两个服务，不能放进命令参数或 shell 输出：
 
 ```bash
 set +x
@@ -301,6 +302,18 @@ assert_api_volume_count 1
 openssl rand -hex 32 |
   railway_cli variable set JWT_SECRET --stdin \
     --service api --environment production --skip-deploys >/dev/null
+
+proxy_secret_file="$run_tmp/internal-proxy-secret"
+openssl rand -hex 32 | tr -d '\n' >"$proxy_secret_file"
+chmod 600 "$proxy_secret_file"
+railway_cli variable set INTERNAL_PROXY_SECRET --stdin \
+  --service api --environment production --skip-deploys \
+  <"$proxy_secret_file" >/dev/null
+railway_cli variable set INTERNAL_PROXY_SECRET --stdin \
+  --service web --environment production --skip-deploys \
+  <"$proxy_secret_file" >/dev/null
+rm -f -- "$proxy_secret_file"
+proxy_secret_file=""
 ```
 
 设置 API 的非秘密值与 Railway 引用变量：
@@ -320,7 +333,7 @@ railway_cli variable set \
   RAILWAY_RUN_UID=0 >/dev/null
 ```
 
-Web 浏览器端只烘焙同源相对路径；私网地址只存在于服务端运行环境。`RAILWAY_PUBLIC_DOMAIN` 由 Railway 自动提供，代理用它生成可信 forwarded origin。
+Web 浏览器端只烘焙同源相对路径；私网地址和共享密钥只存在于服务端运行环境。`RAILWAY_PUBLIC_DOMAIN` 由 Railway 自动提供，代理用它生成可信 forwarded origin。Web 会删除浏览器伪造的共享密钥头并覆写为运行时密钥，API 只在密钥恒定时间比对、Railway 边缘标记和合法 `X-Real-IP` 同时通过时才按真实客户端限流；密钥头永不回传浏览器。
 
 ```bash
 railway_cli variable set \
@@ -516,7 +529,7 @@ UID/卷探针输出只能包含 UID/GID、固定挂载路径和布尔结果；Ho
 secret_file="$run_tmp/smoke-password"
 : >"$secret_file"
 chmod 600 "$secret_file"
-openssl rand -hex 24 >"$secret_file"
+openssl rand -hex 24 | tr -d '\n' >"$secret_file"
 state_file="$run_tmp/smoke-state"
 : >"$state_file"
 chmod 600 "$state_file"
@@ -528,12 +541,160 @@ WEB_URL="$WEB_URL" API_URL="$API_URL" SMOKE_STATE_FILE="$state_file" \
 
 不要退出当前 shell。保留这两个临时文件仅用于后续 API/Postgres 重启持久性与 Chrome 验收；不要打印密码或 Cookie。`state_file` 只允许包含 smoke 邮箱、上传 UUID 和题目 UUID。
 
+### 6.1 逐服务重启与持久性复验
+
+先定义两个 fail-closed 辅助函数。`wait_api_ready` 必须看到精确的演示模式 readiness；`verify_persistence` 每次都重新登录，并验证账号、题目、分析、复习记录与原始上传文件的逐字节内容。密码只从 mode-600 文件读取，不出现在进程参数中：
+
+```bash
+wait_api_ready() {
+  local ready_file="$run_tmp/restart-ready.json"
+  local ready=0
+  local attempt
+  for attempt in $(seq 1 60); do
+    if curl --fail --silent --show-error --connect-timeout 5 --max-time 10 \
+      "$API_URL/ready" >"$ready_file" 2>/dev/null &&
+      python3 - "$ready_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    payload = json.load(source)
+if payload != {"status": "ready", "provider_mode": "demo"}:
+    raise SystemExit(1)
+PY
+    then
+      ready=1
+      break
+    fi
+    sleep 2
+  done
+  if [[ "$ready" != 1 ]]; then
+    echo 'STOP: API did not return exact production readiness after restart' >&2
+    return 1
+  fi
+}
+
+verify_persistence() {
+  local values_file="$run_tmp/restart-state-values"
+  local cookie_jar="$run_tmp/restart-cookies"
+  local login_body="$run_tmp/restart-login.json"
+  local question_body="$run_tmp/restart-question.json"
+  local reviews_body="$run_tmp/restart-reviews.json"
+  local image_body="$run_tmp/restart-image"
+  local image_headers="$run_tmp/restart-image.headers"
+  local smoke_image_path=${SMOKE_IMAGE_PATH:-docs/design/ai-exam-diagnosis-dashboard-selected.png}
+  local login_status question_status reviews_status image_status
+  local email question_id upload_id
+
+  python3 - "$state_file" "$values_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    payload = json.load(source)
+if set(payload) != {"email", "question_id", "upload_id"}:
+    raise SystemExit("STOP: unexpected smoke-state shape")
+values = [payload["email"], payload["question_id"], payload["upload_id"]]
+if any(not isinstance(value, str) or not value or "\n" in value for value in values):
+    raise SystemExit("STOP: malformed smoke-state value")
+with open(sys.argv[2], "w", encoding="utf-8") as target:
+    target.write("\n".join(values) + "\n")
+PY
+  {
+    IFS= read -r email
+    IFS= read -r question_id
+    IFS= read -r upload_id
+  } <"$values_file"
+
+  python3 - "$login_body" "$email" "$secret_file" <<'PY'
+import json
+import sys
+
+output, email, password_path = sys.argv[1:]
+with open(password_path, encoding="utf-8") as source:
+    password = source.read()
+with open(output, "w", encoding="utf-8") as target:
+    json.dump({"email": email, "password": password}, target)
+PY
+
+  login_status=$(curl --silent --show-error --connect-timeout 10 --max-time 60 \
+    --cookie-jar "$cookie_jar" \
+    --header 'Content-Type: application/json' --data-binary @"$login_body" \
+    --output /dev/null --write-out '%{http_code}' \
+    "$WEB_URL/api/v1/auth/login")
+  test "$login_status" = 200
+
+  question_status=$(curl --silent --show-error --connect-timeout 10 --max-time 60 \
+    --cookie "$cookie_jar" \
+    --output "$question_body" --write-out '%{http_code}' \
+    "$WEB_URL/api/v1/questions/$question_id")
+  test "$question_status" = 200
+  python3 - "$question_body" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    payload = json.load(source)
+assert payload["analysis_status"] == "已完成"
+assert payload["mastery_status"] == "复习中"
+assert payload["current_analysis"]["is_demo"] is True
+PY
+
+  reviews_status=$(curl --silent --show-error --connect-timeout 10 --max-time 60 \
+    --cookie "$cookie_jar" \
+    --output "$reviews_body" --write-out '%{http_code}' \
+    "$WEB_URL/api/v1/reviews/questions/$question_id")
+  test "$reviews_status" = 200
+  python3 - "$reviews_body" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    payload = json.load(source)
+assert payload["total"] == 1
+assert len(payload["items"]) == 1
+assert payload["items"][0]["result_status"] == "复习中"
+PY
+
+  test -f "$smoke_image_path"
+  image_status=$(curl --silent --show-error --connect-timeout 10 --max-time 60 \
+    --cookie "$cookie_jar" \
+    --dump-header "$image_headers" --output "$image_body" \
+    --write-out '%{http_code}' "$WEB_URL/api/v1/uploads/$upload_id")
+  test "$image_status" = 200
+  grep -Eqi '^content-type:[[:space:]]*image/(png|jpeg|webp)' "$image_headers"
+  cmp -s "$smoke_image_path" "$image_body"
+
+  rm -f -- "$values_file" "$cookie_jar" "$login_body" "$question_body" \
+    "$reviews_body" "$image_body" "$image_headers"
+}
+```
+
+严格按 API→验证→Postgres→验证的顺序执行。不得连续发出两个重启命令，也不得在中间 readiness 或持久性检查失败后继续：
+
+```bash
+railway_cli service restart \
+  --service api --environment production --yes --json \
+  >"$run_tmp/restart-api.json"
+wait_api_ready
+verify_persistence
+
+railway_cli service restart \
+  --service Postgres --environment production --yes --json \
+  >"$run_tmp/restart-postgres.json"
+wait_api_ready
+verify_persistence
+```
+
+两轮复验都通过后，继续使用同一账号做 Chrome 验收；仍不要提前删除本地临时凭据。
+
 只有重启持久性和 Chrome 验收都结束后，才在同一 shell 执行以下最终清理；这会删除密码、smoke 状态和所有 CLI JSON 快照，并解除 trap：
 
 ```bash
 cleanup_local_artifacts
 trap - EXIT HUP INT TERM
 run_tmp=""
+proxy_secret_file=""
 secret_file=""
 state_file=""
 printf 'local Railway QA credentials removed\n'
@@ -559,4 +720,4 @@ Railway CLI 5.26.0 没有历史版本 rollback 命令。需要回滚应用代码
 - `whoami`、项目列表、变量列表或原始日志全文；
 - 任何 `railway.internal` 地址或变量原值。
 
-相关官方文档：[CLI uploads](https://docs.railway.com/cli/up)、[variables](https://docs.railway.com/cli/variable)、[volumes](https://docs.railway.com/cli/volume)、[deployments](https://docs.railway.com/cli/deployment)、[deployment actions](https://docs.railway.com/deployments/deployment-actions)。
+相关官方文档：[CLI uploads](https://docs.railway.com/cli/up)、[variables](https://docs.railway.com/cli/variable)、[volumes](https://docs.railway.com/cli/volume)、[deployments](https://docs.railway.com/cli/deployment)、[deployment actions](https://docs.railway.com/deployments/deployment-actions)、[public-network request headers](https://docs.railway.com/networking/public-networking/specs-and-limits)。
