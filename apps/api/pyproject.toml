@@ -1,0 +1,32 @@
+[project]
+name = "kaogong-api"
+version = "0.1.0"
+description = "Backend API for the AI exam diagnosis system"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "alembic",
+    "email-validator",
+    "fastapi",
+    "httpx",
+    "openai",
+    "pillow",
+    "psycopg",
+    "pwdlib[argon2]",
+    "pydantic-settings",
+    "pyjwt",
+    "python-multipart",
+    "sqlalchemy[asyncio]",
+    "uvicorn",
+]
+
+[dependency-groups]
+dev = [
+    "aiosqlite",
+    "httpx2>=2.0.0",
+    "pytest",
+    "pytest-cov",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
