@@ -11,11 +11,13 @@ dependencies = [
     "openai",
     "pillow",
     "psycopg",
+    "pypdf",
     "pwdlib[argon2]",
     "pydantic-settings",
     "pyjwt",
     "python-multipart",
     "sqlalchemy[asyncio]",
+    "tencentcloud-sdk-python-ocr",
     "uvicorn",
 ]
 

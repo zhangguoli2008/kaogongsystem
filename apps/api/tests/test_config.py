@@ -35,6 +35,48 @@ def production_settings(tmp_path: Path, **overrides: object) -> Settings:
     return Settings(**values)
 
 
+def test_ocr_configuration_defaults_are_server_controlled() -> None:
+    settings = Settings()
+
+    assert settings.ocr_provider == "mock"
+    assert settings.tencentcloud_secret_id is None
+    assert settings.tencentcloud_secret_key is None
+    assert settings.tencentcloud_region == ""
+    assert settings.tencentcloud_ocr_endpoint == "ocr.tencentcloudapi.com"
+    assert settings.tencentcloud_ocr_timeout_seconds == 30
+    assert settings.tencentcloud_ocr_max_concurrency == 2
+    assert settings.tencentcloud_ocr_queue_timeout_seconds == 5
+    assert settings.tencentcloud_ocr_max_retries == 2
+    assert settings.ocr_rate_limit_per_minute == 5
+    assert settings.ocr_rate_limit_per_hour == 50
+    assert settings.tencentcloud_ocr_use_new_model is False
+    assert settings.tencentcloud_ocr_enable_image_crop is True
+
+
+def test_missing_tencent_credentials_do_not_prevent_startup(tmp_path: Path) -> None:
+    settings = production_settings(
+        tmp_path,
+        ocr_provider="tencent_question_split",
+        tencentcloud_secret_id=None,
+        tencentcloud_secret_key=None,
+    )
+
+    app = create_app(settings)
+
+    assert app.state.settings.ocr_provider == "tencent_question_split"
+
+
+def test_ocr_provider_is_independent_from_analysis_provider_mode() -> None:
+    settings = Settings(
+        provider_mode="demo",
+        openai_api_key=None,
+        ocr_provider="tencent_question_split",
+    )
+
+    assert settings.effective_provider_mode == "demo"
+    assert settings.ocr_provider == "tencent_question_split"
+
+
 def test_explicit_demo_production_configuration_is_accepted(tmp_path: Path) -> None:
     app = create_app(production_settings(tmp_path))
     assert app.state.settings.effective_provider_mode == "demo"
