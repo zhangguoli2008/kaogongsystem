@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -16,6 +17,11 @@ class UploadRead(BaseModel):
     mime_type: str
     size_bytes: int
     created_at: datetime
+    file_kind: Literal["image", "pdf"]
+    width: int | None = None
+    height: int | None = None
+    page_count: int | None = None
+    warnings: list[str] = Field(default_factory=list)
 
 
 class OcrRequest(BaseModel):

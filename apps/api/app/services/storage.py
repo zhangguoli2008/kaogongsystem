@@ -1,37 +1,49 @@
 from __future__ import annotations
 
+import base64
+from dataclasses import dataclass
+import hashlib
 from io import BytesIO
 from pathlib import Path
-from typing import Final
+from typing import Final, Iterator
 from uuid import uuid4
 import warnings
 
 from fastapi import UploadFile
 from PIL import Image, UnidentifiedImageError
+from pypdf import PdfReader
+from pypdf.errors import PdfReadError
 
 
 ALLOWED_FORMATS: Final[dict[str, tuple[str, str]]] = {
     "JPEG": ("image/jpeg", ".jpg"),
     "PNG": ("image/png", ".png"),
-    "WEBP": ("image/webp", ".webp"),
+    "BMP": ("image/bmp", ".bmp"),
 }
-ALLOWED_MIME_TYPES: Final[frozenset[str]] = frozenset(
-    mime for mime, _extension in ALLOWED_FORMATS.values()
-)
 MAX_IMAGE_PIXELS: Final[int] = 25_000_000
 MAX_ORIGINAL_NAME_BYTES: Final[int] = 500
+MIN_OCR_IMAGE_WIDTH: Final[int] = 1_000
+MIN_OCR_IMAGE_HEIGHT: Final[int] = 1_000
 
 
 class UnsupportedImageType(Exception):
-    """The image format is not one of the formats accepted by the service."""
+    """The decoded content is not one of the accepted file types."""
 
 
 class InvalidImage(Exception):
-    """The payload claims to be an image but cannot be decoded safely."""
+    """A payload with a supported image signature cannot be fully decoded."""
+
+
+class InvalidPdf(Exception):
+    """A payload with a PDF signature cannot be parsed safely."""
+
+
+class EmptyFile(Exception):
+    """The uploaded payload has no content."""
 
 
 class UploadTooLarge(Exception):
-    """The payload exceeded the configured upload limit."""
+    """The Base64-encoded payload exceeded the configured upload limit."""
 
 
 class FilenameTooLong(Exception):
@@ -42,24 +54,61 @@ class InvalidFilename(Exception):
     """The client-provided display name contains control characters."""
 
 
-def inspect_image(raw: bytes) -> tuple[str, str]:
-    """Verify and fully decode an image, returning canonical MIME and suffix."""
+class EmptyFilename(InvalidFilename):
+    """The client did not provide a meaningful display name."""
 
+
+@dataclass(frozen=True)
+class FileInspection:
+    mime_type: str
+    extension: str
+    file_kind: str
+    width: int | None = None
+    height: int | None = None
+    page_count: int | None = None
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class StoredUpload:
+    storage_name: str
+    mime_type: str
+    original_name: str
+    size_bytes: int
+    file_kind: str
+    width: int | None
+    height: int | None
+    page_count: int | None
+    warnings: tuple[str, ...]
+    sha256: str
+
+    def __iter__(self) -> Iterator[str | int]:
+        """Preserve the legacy four-value unpacking contract."""
+
+        yield self.storage_name
+        yield self.mime_type
+        yield self.original_name
+        yield self.size_bytes
+
+
+def _quality_warnings(width: int, height: int) -> tuple[str, ...]:
+    if width < MIN_OCR_IMAGE_WIDTH or height < MIN_OCR_IMAGE_HEIGHT:
+        return ("图片分辨率较低，可能影响文字识别准确率",)
+    return ()
+
+
+def _inspect_supported_image(raw: bytes) -> FileInspection:
     try:
-        # Treat Pillow's decompression-bomb warning as an error.  The explicit
-        # dimension check also enforces a lower, application-specific limit
-        # where Pillow itself would otherwise only emit a warning at a much
-        # larger default threshold.
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
-            # verify() checks the file structure without decoding pixels.  A
-            # second open is required because verify() invalidates the object.
             with Image.open(BytesIO(raw)) as image:
-                if image.width * image.height > MAX_IMAGE_PIXELS:
+                width, height = image.size
+                if width * height > MAX_IMAGE_PIXELS:
                     raise InvalidImage
                 image.verify()
             with Image.open(BytesIO(raw)) as image:
-                if image.width * image.height > MAX_IMAGE_PIXELS:
+                width, height = image.size
+                if width * height > MAX_IMAGE_PIXELS:
                     raise InvalidImage
                 detected = image.format
                 image.load()
@@ -75,7 +124,54 @@ def inspect_image(raw: bytes) -> tuple[str, str]:
 
     if detected not in ALLOWED_FORMATS:
         raise UnsupportedImageType
-    return ALLOWED_FORMATS[detected]
+    mime_type, extension = ALLOWED_FORMATS[detected]
+    return FileInspection(
+        mime_type=mime_type,
+        extension=extension,
+        file_kind="image",
+        width=width,
+        height=height,
+        warnings=_quality_warnings(width, height),
+    )
+
+
+def inspect_image(raw: bytes) -> tuple[str, str]:
+    """Verify and fully decode an image, returning canonical MIME and suffix."""
+
+    inspection = _inspect_supported_image(raw)
+    return inspection.mime_type, inspection.extension
+
+
+def _inspect_pdf(raw: bytes) -> FileInspection:
+    try:
+        reader = PdfReader(BytesIO(raw))
+        page_count = len(reader.pages)
+    except (PdfReadError, OSError, ValueError, TypeError) as exc:
+        raise InvalidPdf from exc
+    if page_count < 1:
+        raise InvalidPdf
+    return FileInspection(
+        mime_type="application/pdf",
+        extension=".pdf",
+        file_kind="pdf",
+        page_count=page_count,
+    )
+
+
+def _has_supported_image_signature(raw: bytes) -> bool:
+    return (
+        raw.startswith(b"\x89PNG\r\n\x1a\n")
+        or raw.startswith(b"\xff\xd8\xff")
+        or raw.startswith(b"BM")
+    )
+
+
+def _inspect_file(raw: bytes) -> FileInspection:
+    if raw.startswith(b"%PDF-"):
+        return _inspect_pdf(raw)
+    if _has_supported_image_signature(raw):
+        return _inspect_supported_image(raw)
+    raise UnsupportedImageType
 
 
 async def save_image(
@@ -83,37 +179,48 @@ async def save_image(
     *,
     upload_dir: Path,
     max_upload_bytes: int,
-) -> tuple[str, str, str, int]:
-    """Validate and persist an uploaded image.
+) -> StoredUpload:
+    """Validate and persist a question image or PDF by decoded content."""
 
-    The returned tuple is ``(storage_name, canonical_mime, original_name,
-    size_bytes)``.  Files are addressed solely by a random UUID and canonical
-    extension; the client-provided name never becomes part of a path.
-    """
-
-    if file.content_type and file.content_type not in ALLOWED_MIME_TYPES:
-        raise UnsupportedImageType
-
-    original_name = file.filename or "upload"
+    original_name = file.filename
+    if original_name is None or not original_name.strip():
+        raise EmptyFilename
     if any(ord(char) < 32 or ord(char) == 127 for char in original_name):
         raise InvalidFilename
     if len(original_name.encode("utf-8")) > MAX_ORIGINAL_NAME_BYTES:
         raise FilenameTooLong
 
     raw = await file.read(max_upload_bytes + 1)
-    if len(raw) > max_upload_bytes:
+    if not raw:
+        raise EmptyFile
+    if len(base64.b64encode(raw)) > max_upload_bytes:
         raise UploadTooLarge
 
-    mime_type, extension = inspect_image(raw)
-    storage_name = f"{uuid4().hex}{extension}"
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    inspection = _inspect_file(raw)
+    sha256 = hashlib.sha256(raw).hexdigest()
+    storage_name = f"{uuid4().hex}{inspection.extension}"
     target = upload_dir / storage_name
-    # UUID names cannot contain path separators; resolve defensively in case a
-    # future naming change ever violates that invariant.
+    upload_dir.mkdir(parents=True, exist_ok=True)
     if target.parent.resolve() != upload_dir.resolve():
         raise InvalidImage
-    target.write_bytes(raw)
-    return storage_name, mime_type, original_name, len(raw)
+    try:
+        target.write_bytes(raw)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+
+    return StoredUpload(
+        storage_name=storage_name,
+        mime_type=inspection.mime_type,
+        original_name=original_name,
+        size_bytes=len(raw),
+        file_kind=inspection.file_kind,
+        width=inspection.width,
+        height=inspection.height,
+        page_count=inspection.page_count,
+        warnings=inspection.warnings,
+        sha256=sha256,
+    )
 
 
 def image_path(upload_dir: Path, storage_name: str) -> Path:
