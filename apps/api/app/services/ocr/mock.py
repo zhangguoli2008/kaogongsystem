@@ -10,6 +10,7 @@ class MockOCRProvider:
 
     name = "mock"
     is_demo = True
+    is_configured = True
 
     async def recognize_questions(
         self,

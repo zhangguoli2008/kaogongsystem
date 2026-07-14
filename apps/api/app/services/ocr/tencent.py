@@ -50,6 +50,13 @@ class TencentOCRProvider:
         self._jitter = jitter or (lambda: random.uniform(0.0, 0.1))
         self._client: Any | None = None
 
+    @property
+    def is_configured(self) -> bool:
+        return bool(
+            self._settings.tencentcloud_secret_id
+            and self._settings.tencentcloud_secret_key
+        )
+
     def _get_client(self) -> Any:
         if self._client is not None:
             return self._client

@@ -10,10 +10,10 @@ import logging
 from pathlib import Path
 from threading import Lock
 from time import monotonic
-from typing import AsyncIterator
-from uuid import uuid4
+from typing import AsyncIterator, TypeVar
+from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -44,6 +44,37 @@ from app.services.storage import (
 
 logger = logging.getLogger(__name__)
 PARAMETER_VERSION = "question-split-v1"
+_TaskResult = TypeVar("_TaskResult")
+
+
+async def _await_task_completion(
+    task: asyncio.Task[_TaskResult],
+) -> tuple[_TaskResult, bool]:
+    """Wait for a side effect to finish without abandoning it on cancellation."""
+
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    return task.result(), cancelled
+
+
+def _failed_task_claim_statement(idempotency_key: str):
+    return (
+        update(OCRTask)
+        .where(
+            OCRTask.idempotency_key == idempotency_key,
+            OCRTask.status == "failed",
+        )
+        .values(
+            status="processing",
+            provider_request_id=None,
+            error_code=None,
+            error_message=None,
+        )
+    )
 
 
 class _LockEntry:
@@ -112,20 +143,22 @@ class OCRService:
             raise APIError(404, "OCR_SOURCE_NOT_FOUND", "未找到上传文件")
 
         raw, inspection = await asyncio.to_thread(self._read_and_inspect, asset)
-        if pdf_page_number < 1 or (
-            inspection.file_kind == "pdf"
-            and (
-                inspection.page_count is None
+        if inspection.file_kind == "pdf":
+            if (
+                pdf_page_number < 1
+                or inspection.page_count is None
                 or pdf_page_number > inspection.page_count
-            )
-        ):
-            raise APIError(422, "OCR_INVALID_PDF_PAGE", "PDF 页码无效")
+            ):
+                raise APIError(422, "OCR_INVALID_PDF_PAGE", "PDF 页码无效")
+            effective_page_number = pdf_page_number
+        else:
+            effective_page_number = 1
 
         source_hash = hashlib.sha256(raw).hexdigest()
         idempotency_key = self._idempotency_key(
             user_id=user_id,
             source_hash=source_hash,
-            pdf_page_number=pdf_page_number,
+            pdf_page_number=effective_page_number,
         )
         async with _KeyedLocks.hold(idempotency_key):
             task, cached = await self._claim_task(
@@ -133,16 +166,20 @@ class OCRService:
                 user_id=user_id,
                 asset=asset,
                 source_hash=source_hash,
-                pdf_page_number=pdf_page_number,
+                pdf_page_number=effective_page_number,
                 idempotency_key=idempotency_key,
             )
             if cached is not None:
                 return cached
 
             acquired = False
-            generated_storage_names: list[str] = []
+            generated_assets: list[tuple[str, str]] = []
             provider_request_id: str | None = None
+            success_committed = False
             try:
+                if not getattr(self._provider, "is_configured", True):
+                    raise APIError(503, "OCR_NOT_CONFIGURED", "OCR 服务未配置")
+
                 try:
                     await asyncio.wait_for(
                         self._semaphore.acquire(),
@@ -164,7 +201,7 @@ class OCRService:
                         raw,
                         asset.original_name,
                         inspection.mime_type,
-                        pdf_page_number,
+                        effective_page_number,
                     )
                 finally:
                     self._semaphore.release()
@@ -174,7 +211,7 @@ class OCRService:
                     raw_response,
                     provider=self._provider.name,
                     file_id=asset.id,
-                    page_number=pdf_page_number,
+                    page_number=effective_page_number,
                     is_demo=self._provider.is_demo,
                 )
                 result.warnings = [*inspection.warnings, *result.warnings]
@@ -184,6 +221,16 @@ class OCRService:
                     result,
                     source_raw=raw,
                     source_file_kind=inspection.file_kind,
+                    max_corrected_image_bytes=(
+                        self._settings.ocr_corrected_image_max_bytes
+                    ),
+                    max_corrected_images_total_bytes=(
+                        self._settings.ocr_corrected_images_max_total_bytes
+                    ),
+                    max_artifacts=self._settings.ocr_crop_max_artifacts,
+                    max_total_png_bytes=(
+                        self._settings.ocr_crop_max_total_png_bytes
+                    ),
                 )
                 result.warnings.extend(crop_batch.warnings)
                 await self._persist_crops(
@@ -191,7 +238,7 @@ class OCRService:
                     user_id=user_id,
                     result=result,
                     artifacts=crop_batch.artifacts,
-                    generated_storage_names=generated_storage_names,
+                    generated_assets=generated_assets,
                 )
                 task.status = "succeeded"
                 task.question_count = result.question_count
@@ -199,7 +246,9 @@ class OCRService:
                 task.normalized_result_json = result.model_dump(mode="json")
                 task.error_code = None
                 task.error_message = None
-                await session.commit()
+                commit_task = asyncio.create_task(session.commit())
+                _, cancelled_during_commit = await _await_task_completion(commit_task)
+                success_committed = True
                 self._log_completion(
                     local_request_id=local_request_id,
                     user_id=user_id,
@@ -209,27 +258,53 @@ class OCRService:
                     count=result.question_count,
                     error_code=None,
                     file_size=len(raw),
-                    page=pdf_page_number,
+                    page=effective_page_number,
                 )
+                if cancelled_during_commit:
+                    raise asyncio.CancelledError
                 return result
             except asyncio.CancelledError:
+                if success_committed:
+                    raise
                 error = APIError(499, "OCR_CANCELLED", "OCR 请求已取消")
-                await asyncio.shield(
+                failed_task = asyncio.create_task(
                     self._mark_failed(
                         session,
                         task.id,
                         error,
-                        generated_storage_names=generated_storage_names,
+                        generated_assets=generated_assets,
+                        provider_request_id=self._safe_provider_request_id(
+                            provider_request_id
+                        ),
                     )
+                )
+                await _await_task_completion(failed_task)
+                self._log_completion(
+                    local_request_id=local_request_id,
+                    user_id=user_id,
+                    provider_request_id=self._safe_provider_request_id(
+                        provider_request_id
+                    ),
+                    duration=monotonic() - started,
+                    success=False,
+                    count=0,
+                    error_code=error.code,
+                    file_size=len(raw),
+                    page=effective_page_number,
                 )
                 raise
             except Exception as exc:
+                if isinstance(exc, OCRProviderError):
+                    provider_request_id = self._safe_provider_request_id(
+                        exc.request_id
+                    )
                 error = self._safe_error(exc)
                 await self._mark_failed(
                     session,
                     task.id,
                     error,
-                    generated_storage_names=generated_storage_names,
+                    generated_assets=generated_assets,
+                    provider_request_id=provider_request_id,
                 )
                 self._log_completion(
                     local_request_id=local_request_id,
@@ -240,7 +315,7 @@ class OCRService:
                     count=0,
                     error_code=error.code,
                     file_size=len(raw),
-                    page=pdf_page_number,
+                    page=effective_page_number,
                 )
                 if isinstance(exc, APIError):
                     raise
@@ -292,19 +367,26 @@ class OCRService:
         pdf_page_number: int,
         idempotency_key: str,
     ) -> tuple[OCRTask, OcrResult | None]:
+        claimed = await self._try_claim_failed_task(session, idempotency_key)
         task = await session.scalar(
             select(OCRTask).where(OCRTask.idempotency_key == idempotency_key)
         )
         if task is not None:
+            if claimed:
+                return task, None
             if task.status == "succeeded" and task.normalized_result_json is not None:
                 return task, OcrResult.model_validate(task.normalized_result_json)
             if task.status == "processing":
                 raise APIError(409, "OCR_IN_PROGRESS", "OCR 任务正在处理中")
-            task.status = "processing"
-            task.error_code = None
-            task.error_message = None
-            await session.commit()
-            return task, None
+            if await self._try_claim_failed_task(session, idempotency_key):
+                refreshed = await session.scalar(
+                    select(OCRTask).where(
+                        OCRTask.idempotency_key == idempotency_key
+                    )
+                )
+                if refreshed is not None:
+                    return refreshed, None
+            raise APIError(409, "OCR_IN_PROGRESS", "OCR 任务正在处理中")
 
         task = OCRTask(
             user_id=user_id,
@@ -322,11 +404,14 @@ class OCRService:
             await session.commit()
         except IntegrityError:
             await session.rollback()
+            claimed = await self._try_claim_failed_task(session, idempotency_key)
             existing = await session.scalar(
                 select(OCRTask).where(OCRTask.idempotency_key == idempotency_key)
             )
             if existing is None:
                 raise
+            if claimed:
+                return existing, None
             if (
                 existing.status == "succeeded"
                 and existing.normalized_result_json is not None
@@ -336,12 +421,29 @@ class OCRService:
                 )
             if existing.status == "processing":
                 raise APIError(409, "OCR_IN_PROGRESS", "OCR 任务正在处理中")
-            existing.status = "processing"
-            existing.error_code = None
-            existing.error_message = None
-            await session.commit()
-            return existing, None
+            if await self._try_claim_failed_task(session, idempotency_key):
+                refreshed = await session.scalar(
+                    select(OCRTask).where(
+                        OCRTask.idempotency_key == idempotency_key
+                    )
+                )
+                if refreshed is not None:
+                    return refreshed, None
+            raise APIError(409, "OCR_IN_PROGRESS", "OCR 任务正在处理中")
         return task, None
+
+    @staticmethod
+    async def _try_claim_failed_task(
+        session: AsyncSession,
+        idempotency_key: str,
+    ) -> bool:
+        result = await session.execute(
+            _failed_task_claim_statement(idempotency_key),
+            execution_options={"synchronize_session": False},
+        )
+        claimed = result.rowcount == 1
+        await session.commit()
+        return claimed
 
     async def _persist_crops(
         self,
@@ -350,17 +452,24 @@ class OCRService:
         user_id: str,
         result: OcrResult,
         artifacts: tuple[CropArtifact, ...],
-        generated_storage_names: list[str],
+        generated_assets: list[tuple[str, str]],
     ) -> None:
         for artifact in artifacts:
-            stored = await asyncio.to_thread(
-                save_generated_png,
-                artifact.png_bytes,
-                upload_dir=self._settings.upload_dir,
-                original_name=artifact.original_name,
-            )
-            generated_storage_names.append(stored.storage_name)
             asset_id = str(uuid4())
+            storage_name = f"{uuid4().hex}.png"
+            generated_assets.append((asset_id, storage_name))
+            write_task = asyncio.create_task(
+                asyncio.to_thread(
+                    save_generated_png,
+                    artifact.png_bytes,
+                    upload_dir=self._settings.upload_dir,
+                    original_name=artifact.original_name,
+                    storage_name=storage_name,
+                )
+            )
+            stored, cancelled_during_write = await _await_task_completion(write_task)
+            if cancelled_during_write:
+                raise asyncio.CancelledError
             session.add(
                 UploadedAsset(
                     id=asset_id,
@@ -401,7 +510,7 @@ class OCRService:
         if isinstance(exc, APIError):
             return exc
         if isinstance(exc, NoQuestionDetected):
-            return APIError(422, "OCR_NO_QUESTION_DETECTED", "未识别到有效题目")
+            return APIError(422, "OCR_NO_QUESTION", "未识别到有效题目")
         if isinstance(exc, OCRProviderError):
             mapped = map_provider_exception(exc)
             return APIError(mapped.status_code, mapped.code, mapped.message)
@@ -413,10 +522,21 @@ class OCRService:
         task_id: str,
         error: APIError,
         *,
-        generated_storage_names: list[str],
+        generated_assets: list[tuple[str, str]],
+        provider_request_id: str | None,
     ) -> None:
         await session.rollback()
-        for storage_name in generated_storage_names:
+        task = await session.get(OCRTask, task_id, populate_existing=True)
+        if (
+            task is not None
+            and task.status == "succeeded"
+            and task.normalized_result_json is not None
+        ):
+            # A commit can succeed server-side and still surface an I/O error to
+            # the caller. In that ambiguous case the committed task and assets
+            # are authoritative and must remain intact for the next retry.
+            return
+        for _, storage_name in generated_assets:
             try:
                 await asyncio.to_thread(
                     image_path(self._settings.upload_dir, storage_name).unlink,
@@ -424,15 +544,25 @@ class OCRService:
                 )
             except OSError:
                 logger.error("Failed to remove OCR generated asset")
-        task = await session.get(OCRTask, task_id)
         if task is None:
             return
         task.status = "failed"
         task.question_count = 0
+        task.provider_request_id = provider_request_id
         task.normalized_result_json = None
         task.error_code = error.code
         task.error_message = error.message
         await session.commit()
+
+    @staticmethod
+    def _safe_provider_request_id(value: str | None) -> str | None:
+        if value is None or len(value) != 36:
+            return None
+        try:
+            parsed = UUID(value)
+        except (ValueError, AttributeError):
+            return None
+        return str(parsed)
 
     def _log_completion(
         self,
@@ -454,12 +584,13 @@ class OCRService:
                 "user_id": user_id,
                 "provider": self._provider.name,
                 "api_name": API_NAME,
+                "request_id": provider_request_id,
                 "provider_request_id": provider_request_id,
-                "duration_seconds": duration,
+                "duration_ms": int(max(0.0, duration) * 1000),
                 "success": success,
                 "question_count": count,
                 "error_code": error_code,
                 "file_size": file_size,
-                "page": page,
+                "pdf_page_number": page,
             },
         )

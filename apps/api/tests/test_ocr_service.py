@@ -4,10 +4,12 @@ import hashlib
 import json
 from io import BytesIO
 from pathlib import Path
+import threading
 
 from PIL import Image
 import pytest
 from pypdf import PdfWriter
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -21,7 +23,7 @@ from app.models.upload import UploadedAsset
 from app.models.user import User
 from app.services.ocr.service import OCRService, PARAMETER_VERSION, _KeyedLocks
 import app.services.ocr.service as ocr_service_module
-from app.services.ocr.errors import OCRProviderError
+from app.services.ocr.errors import OCRProviderError, not_configured_error
 from app.services.ocr.types import Response
 from app.services.ocr_contract import API_NAME
 
@@ -61,6 +63,7 @@ class FakeProvider:
         self.max_active = 0
         self.started = asyncio.Event()
         self.gate = gate
+        self.pages: list[int] = []
 
     async def recognize_questions(
         self,
@@ -69,8 +72,9 @@ class FakeProvider:
         content_type: str,
         pdf_page_number: int = 1,
     ) -> Response:
-        del file_bytes, filename, content_type, pdf_page_number
+        del file_bytes, filename, content_type
         self.calls += 1
+        self.pages.append(pdf_page_number)
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         self.started.set()
@@ -243,6 +247,136 @@ class ZeroAreaProvider(FakeProvider):
                 ],
                 "RequestId": "zero-area",
             }
+        )
+
+
+class UnconfiguredProvider(FakeProvider):
+    is_configured = False
+
+    async def recognize_questions(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        content_type: str,
+        pdf_page_number: int = 1,
+    ) -> Response:
+        del file_bytes, filename, content_type, pdf_page_number
+        self.calls += 1
+        raise not_configured_error()
+
+
+class RequestIdFailingProvider(FakeProvider):
+    def __init__(self, request_id: str) -> None:
+        super().__init__()
+        self.request_id = request_id
+
+    async def recognize_questions(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        content_type: str,
+        pdf_page_number: int = 1,
+    ) -> Response:
+        del file_bytes, filename, content_type, pdf_page_number
+        self.calls += 1
+        raise OCRProviderError(
+            status_code=502,
+            code="OCR_PROVIDER_ERROR",
+            message="OCR 服务暂时不可用",
+            retryable=False,
+            request_id=self.request_id,
+        )
+
+
+class NoQuestionProvider(FakeProvider):
+    async def recognize_questions(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        content_type: str,
+        pdf_page_number: int = 1,
+    ) -> Response:
+        del file_bytes, filename, content_type, pdf_page_number
+        self.calls += 1
+        return Response.model_validate(
+            {
+                "QuestionInfo": [{"ResultList": []}],
+                "RequestId": "no-question-request",
+            }
+        )
+
+
+class SizedCorrectedProvider(FakeProvider):
+    def __init__(self, encoded: str) -> None:
+        super().__init__()
+        self.encoded = encoded
+
+    async def recognize_questions(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        content_type: str,
+        pdf_page_number: int = 1,
+    ) -> Response:
+        del file_bytes, filename, content_type, pdf_page_number
+        self.calls += 1
+        return Response.model_validate(
+            {
+                "QuestionInfo": [
+                    {
+                        "Width": 100,
+                        "Height": 100,
+                        "OrgWidth": 100,
+                        "OrgHeight": 100,
+                        "ImageBase64": self.encoded,
+                        "ResultList": [
+                            {
+                                "Question": [{"Index": 0, "Text": "1. 大图测试"}],
+                                "Coord": [_polygon(0, 0, 20, 20)],
+                            }
+                        ],
+                    }
+                ],
+                "RequestId": "sized-corrected",
+            }
+        )
+
+
+class MultiCorrectedProvider(FakeProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.encoded = base64.b64encode(_png_bytes("blue")).decode("ascii")
+
+    async def recognize_questions(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        content_type: str,
+        pdf_page_number: int = 1,
+    ) -> Response:
+        del file_bytes, filename, content_type, pdf_page_number
+        self.calls += 1
+        infos = []
+        for number in (1, 2):
+            infos.append(
+                {
+                    "Width": 100,
+                    "Height": 100,
+                    "OrgWidth": 100,
+                    "OrgHeight": 100,
+                    "ImageBase64": self.encoded,
+                    "ResultList": [
+                        {
+                            "Question": [
+                                {"Index": 0, "Text": f"{number}. 累计图测试"}
+                            ],
+                            "Coord": [_polygon(0, 0, 20, 20)],
+                        }
+                    ],
+                }
+            )
+        return Response.model_validate(
+            {"QuestionInfo": infos, "RequestId": "multi-corrected"}
         )
 
 
@@ -919,3 +1053,575 @@ def test_create_app_builds_one_reusable_ocr_service_without_live_credentials(
 
     assert app.state.ocr_provider.name == "tencent_question_split"
     assert app.state.ocr_service._provider is app.state.ocr_provider
+
+
+def test_failed_task_claim_is_atomic_without_process_key_lock(tmp_path):
+    class ScalarBarrierSession:
+        def __init__(self, session, barrier) -> None:
+            self._session = session
+            self._barrier = barrier
+
+        async def scalar(self, *args, **kwargs):
+            value = await self._session.scalar(*args, **kwargs)
+            self._barrier["count"] += 1
+            if self._barrier["count"] == 2:
+                self._barrier["ready"].set()
+            await asyncio.wait_for(self._barrier["ready"].wait(), timeout=2)
+            return value
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        try:
+            user_id, source = await _source_asset(factory, settings)
+            provider = FakeProvider()
+            service = OCRService(provider, settings)
+            raw = (settings.upload_dir / source.storage_name).read_bytes()
+            source_hash = hashlib.sha256(raw).hexdigest()
+            key = service._idempotency_key(
+                user_id=user_id,
+                source_hash=source_hash,
+                pdf_page_number=1,
+            )
+            async with factory() as session:
+                session.add(
+                    OCRTask(
+                        user_id=user_id,
+                        source_file_id=source.id,
+                        provider=provider.name,
+                        api_name=API_NAME,
+                        source_file_hash=source_hash,
+                        pdf_page_number=1,
+                        parameter_version=PARAMETER_VERSION,
+                        idempotency_key=key,
+                        status="failed",
+                        error_code="OCR_PROVIDER_ERROR",
+                        error_message="OCR 服务暂时不可用",
+                    )
+                )
+                await session.commit()
+
+            first_session = factory()
+            second_session = factory()
+            barrier = {"count": 0, "ready": asyncio.Event()}
+            try:
+                outcomes = await asyncio.gather(
+                    service._claim_task(
+                        ScalarBarrierSession(first_session, barrier),
+                        user_id=user_id,
+                        asset=source,
+                        source_hash=source_hash,
+                        pdf_page_number=1,
+                        idempotency_key=key,
+                    ),
+                    service._claim_task(
+                        ScalarBarrierSession(second_session, barrier),
+                        user_id=user_id,
+                        asset=source,
+                        source_hash=source_hash,
+                        pdf_page_number=1,
+                        idempotency_key=key,
+                    ),
+                    return_exceptions=True,
+                )
+            finally:
+                await first_session.close()
+                await second_session.close()
+
+            claims = [outcome for outcome in outcomes if isinstance(outcome, tuple)]
+            errors = [outcome for outcome in outcomes if isinstance(outcome, APIError)]
+            assert len(claims) == 1
+            assert len(errors) == 1
+            assert errors[0].code == "OCR_IN_PROGRESS"
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_failed_task_claim_statement_compiles_for_sqlite_and_postgresql():
+    statement = ocr_service_module._failed_task_claim_statement("key-123")
+
+    for dialect in (sqlite.dialect(), postgresql.dialect()):
+        compiled = str(
+            statement.compile(dialect=dialect, compile_kwargs={"literal_binds": True})
+        ).lower()
+        assert "update ocr_tasks" in compiled
+        assert "idempotency_key" in compiled
+        assert "status = 'failed'" in compiled
+
+
+def test_dual_window_clock_is_sampled_inside_the_atomic_section():
+    first_clock_called = threading.Event()
+    second_clock_called = threading.Event()
+    release_first_clock = threading.Event()
+    call_guard = threading.Lock()
+    calls = 0
+
+    def ordered_clock() -> float:
+        nonlocal calls
+        with call_guard:
+            position = calls
+            calls += 1
+        if position == 0:
+            first_clock_called.set()
+            assert release_first_clock.wait(timeout=2)
+            return 5.0
+        second_clock_called.set()
+        return 10.0
+
+    limiter = DualWindowRateLimiter(
+        minute_limit=5,
+        hour_limit=50,
+        clock=ordered_clock,
+    )
+    first = threading.Thread(target=limiter.allow, args=("user",))
+    second = threading.Thread(target=limiter.allow, args=("user",))
+
+    first.start()
+    assert first_clock_called.wait(timeout=1)
+    second.start()
+    second_clock_called.wait(timeout=0.5)
+    release_first_clock.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert list(limiter._attempts["user"]) == [5.0, 10.0]
+
+
+def test_image_page_number_is_normalized_to_one_and_reuses_cache(tmp_path):
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        try:
+            user_id, source = await _source_asset(factory, settings)
+            provider = FakeProvider()
+            service = OCRService(provider, settings)
+            async with factory() as session:
+                first = await service.recognize(
+                    session,
+                    user_id=user_id,
+                    asset=source,
+                    pdf_page_number=9,
+                    local_request_id="image-page-nine",
+                )
+            async with factory() as session:
+                cached = await service.recognize(
+                    session,
+                    user_id=user_id,
+                    asset=source,
+                    pdf_page_number=1,
+                    local_request_id="image-page-one",
+                )
+            async with factory() as session:
+                task = await session.scalar(select(OCRTask))
+            assert provider.calls == 1
+            assert provider.pages == [1]
+            assert first.page_number == cached.page_number == 1
+            assert task is not None
+            assert task.pdf_page_number == 1
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_unconfigured_provider_preflight_never_consumes_user_limit(tmp_path):
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        try:
+            user_id, source = await _source_asset(factory, settings)
+            provider = UnconfiguredProvider()
+            limiter = DualWindowRateLimiter(minute_limit=1, hour_limit=1)
+            service = OCRService(provider, settings, rate_limiter=limiter)
+            for attempt in range(3):
+                async with factory() as session:
+                    with pytest.raises(APIError) as caught:
+                        await service.recognize(
+                            session,
+                            user_id=user_id,
+                            asset=source,
+                            pdf_page_number=1,
+                            local_request_id=f"not-configured-{attempt}",
+                        )
+                assert caught.value.code == "OCR_NOT_CONFIGURED"
+            assert provider.calls == 0
+            assert "user" not in limiter._attempts
+            assert user_id not in limiter._attempts
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("request_id", "expected"),
+    [
+        (
+            "123e4567-e89b-12d3-a456-426614174000",
+            "123e4567-e89b-12d3-a456-426614174000",
+        ),
+        ("AKID-example-secret-shaped-value", None),
+        ("unsafe\nraw-base64", None),
+    ],
+)
+def test_provider_error_persists_and_logs_only_safe_request_id(
+    request_id, expected, tmp_path, caplog
+):
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        try:
+            user_id, source = await _source_asset(factory, settings)
+            service = OCRService(RequestIdFailingProvider(request_id), settings)
+            with caplog.at_level("INFO", logger="app.services.ocr.service"):
+                async with factory() as session:
+                    with pytest.raises(APIError):
+                        await service.recognize(
+                            session,
+                            user_id=user_id,
+                            asset=source,
+                            pdf_page_number=1,
+                            local_request_id="request-id-failure",
+                        )
+            async with factory() as session:
+                task = await session.scalar(select(OCRTask))
+            assert task is not None
+            assert task.provider_request_id == expected
+            completion = [
+                record
+                for record in caplog.records
+                if record.message == "OCR request completed"
+            ][-1]
+            assert completion.provider_request_id == expected
+            if expected is None:
+                assert request_id not in caplog.text
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_no_question_uses_prd_error_code(tmp_path):
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        try:
+            user_id, source = await _source_asset(factory, settings)
+            service = OCRService(NoQuestionProvider(), settings)
+            async with factory() as session:
+                with pytest.raises(APIError) as caught:
+                    await service.recognize(
+                        session,
+                        user_id=user_id,
+                        asset=source,
+                        pdf_page_number=1,
+                        local_request_id="no-question",
+                    )
+            assert caught.value.code == "OCR_NO_QUESTION"
+            async with factory() as session:
+                task = await session.scalar(select(OCRTask))
+            assert task is not None
+            assert task.error_code == "OCR_NO_QUESTION"
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_oversized_corrected_base64_is_skipped_before_decode(
+    tmp_path, monkeypatch, caplog
+):
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        settings = settings.model_copy(
+            update={
+                "ocr_corrected_image_max_bytes": 16,
+                "ocr_corrected_images_max_total_bytes": 16,
+            }
+        )
+        try:
+            user_id, source = await _source_asset(factory, settings, color="red")
+            encoded = base64.b64encode(_png_bytes("blue")).decode("ascii")
+            provider = SizedCorrectedProvider(encoded)
+
+            def forbidden_decode(*args, **kwargs):
+                raise AssertionError("oversized corrected Base64 was decoded")
+
+            monkeypatch.setattr(
+                "app.services.ocr.cropper.base64.b64decode", forbidden_decode
+            )
+            service = OCRService(provider, settings)
+            with caplog.at_level("INFO", logger="app.services.ocr.service"):
+                async with factory() as session:
+                    result = await service.recognize(
+                        session,
+                        user_id=user_id,
+                        asset=source,
+                        pdf_page_number=1,
+                        local_request_id="oversized-corrected",
+                    )
+            assert any("大小上限" in warning for warning in result.warnings)
+            async with factory() as session:
+                crop_asset = await session.get(
+                    UploadedAsset, result.questions[0].crop_asset_id
+                )
+            assert crop_asset is not None
+            with Image.open(settings.upload_dir / crop_asset.storage_name) as crop:
+                assert crop.getpixel((0, 0)) == (255, 0, 0)
+            assert encoded not in caplog.text
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_corrected_images_enforce_per_response_total_budget(tmp_path):
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        provider = MultiCorrectedProvider()
+        decoded_size = len(_png_bytes("blue"))
+        settings = settings.model_copy(
+            update={
+                "ocr_corrected_image_max_bytes": decoded_size + 1,
+                "ocr_corrected_images_max_total_bytes": decoded_size + 1,
+            }
+        )
+        try:
+            user_id, source = await _source_asset(factory, settings, color="red")
+            service = OCRService(provider, settings)
+            async with factory() as session:
+                result = await service.recognize(
+                    session,
+                    user_id=user_id,
+                    asset=source,
+                    pdf_page_number=1,
+                    local_request_id="corrected-total-budget",
+                )
+            assert result.question_count == 2
+            assert any("累计大小上限" in warning for warning in result.warnings)
+            async with factory() as session:
+                first_asset = await session.get(
+                    UploadedAsset, result.questions[0].crop_asset_id
+                )
+                second_asset = await session.get(
+                    UploadedAsset, result.questions[1].crop_asset_id
+                )
+            assert first_asset is not None
+            assert second_asset is not None
+            with Image.open(settings.upload_dir / first_asset.storage_name) as first:
+                assert first.getpixel((0, 0)) == (0, 0, 255)
+            with Image.open(settings.upload_dir / second_asset.storage_name) as second:
+                assert second.getpixel((0, 0)) == (255, 0, 0)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_crop_artifact_count_budget_skips_excess_assets(tmp_path):
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        settings = settings.model_copy(update={"ocr_crop_max_artifacts": 2})
+        try:
+            user_id, source = await _source_asset(factory, settings, color="red")
+            service = OCRService(CroppingProvider(), settings)
+            async with factory() as session:
+                result = await service.recognize(
+                    session,
+                    user_id=user_id,
+                    asset=source,
+                    pdf_page_number=1,
+                    local_request_id="artifact-count-budget",
+                )
+            async with factory() as session:
+                assets = (
+                    await session.scalars(
+                        select(UploadedAsset).where(UploadedAsset.user_id == user_id)
+                    )
+                ).all()
+            assert len(assets) == 3
+            assert result.question_count == 1
+            assert any("裁剪图片数量上限" in warning for warning in result.warnings)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_crop_png_total_byte_budget_skips_before_allocating_crop(
+    tmp_path, monkeypatch
+):
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        settings = settings.model_copy(update={"ocr_crop_max_total_png_bytes": 1})
+        try:
+            user_id, source = await _source_asset(factory, settings, color="red")
+            service = OCRService(CroppingProvider(), settings)
+
+            def forbidden_crop(*args, **kwargs):
+                raise AssertionError("oversized crop was allocated")
+
+            monkeypatch.setattr(
+                "app.services.ocr.cropper.Image.Image.crop", forbidden_crop
+            )
+            async with factory() as session:
+                result = await service.recognize(
+                    session,
+                    user_id=user_id,
+                    asset=source,
+                    pdf_page_number=1,
+                    local_request_id="artifact-byte-budget",
+                )
+            async with factory() as session:
+                assets = (
+                    await session.scalars(
+                        select(UploadedAsset).where(UploadedAsset.user_id == user_id)
+                    )
+                ).all()
+            assert [asset.id for asset in assets] == [source.id]
+            assert result.question_count == 1
+            assert result.questions[0].crop_asset_id is None
+            assert any(
+                "内存预算" in warning
+                for warning in result.questions[0].warnings
+            )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_cancellation_during_crop_write_waits_then_cleans_file_and_row(
+    tmp_path, monkeypatch, caplog
+):
+    write_started = threading.Event()
+    release_write = threading.Event()
+    real_save = ocr_service_module.save_generated_png
+
+    def slow_save(*args, **kwargs):
+        write_started.set()
+        assert release_write.wait(timeout=3)
+        return real_save(*args, **kwargs)
+
+    monkeypatch.setattr(ocr_service_module, "save_generated_png", slow_save)
+
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        session = factory()
+        try:
+            user_id, source = await _source_asset(factory, settings, color="red")
+            service = OCRService(CroppingProvider(), settings)
+            with caplog.at_level("INFO", logger="app.services.ocr.service"):
+                pending = asyncio.create_task(
+                    service.recognize(
+                        session,
+                        user_id=user_id,
+                        asset=source,
+                        pdf_page_number=1,
+                        local_request_id="cancel-during-write",
+                    )
+                )
+                assert await asyncio.to_thread(write_started.wait, 2)
+                pending.cancel()
+                await asyncio.sleep(0)
+                release_write.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+
+            async with factory() as check_session:
+                assets = (
+                    await check_session.scalars(
+                        select(UploadedAsset).where(UploadedAsset.user_id == user_id)
+                    )
+                ).all()
+                task = await check_session.scalar(select(OCRTask))
+            assert [asset.id for asset in assets] == [source.id]
+            assert task is not None
+            assert task.status == "failed"
+            assert task.error_code == "OCR_CANCELLED"
+            assert sorted(path.name for path in settings.upload_dir.iterdir()) == [
+                source.storage_name
+            ]
+            completion = [
+                record
+                for record in caplog.records
+                if record.message == "OCR request completed"
+            ][-1]
+            assert completion.error_code == "OCR_CANCELLED"
+            assert completion.success is False
+            assert completion.pdf_page_number == 1
+            assert isinstance(completion.duration_ms, int)
+        finally:
+            release_write.set()
+            await session.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_successful_but_ambiguous_commit_keeps_committed_assets_and_cache(tmp_path):
+    class CommitUnknownSession:
+        def __init__(self, session) -> None:
+            self._session = session
+            self.commit_calls = 0
+
+        async def commit(self):
+            self.commit_calls += 1
+            await self._session.commit()
+            if self.commit_calls == 3:
+                raise OSError("commit result unavailable")
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        try:
+            user_id, source = await _source_asset(factory, settings, color="red")
+            provider = CroppingProvider()
+            service = OCRService(provider, settings)
+            async with factory() as real_session:
+                wrapped = CommitUnknownSession(real_session)
+                with pytest.raises(APIError) as caught:
+                    await service.recognize(
+                        wrapped,
+                        user_id=user_id,
+                        asset=source,
+                        pdf_page_number=1,
+                        local_request_id="ambiguous-commit",
+                    )
+            assert caught.value.code == "OCR_PROCESSING_FAILED"
+
+            async with factory() as check_session:
+                task = await check_session.scalar(select(OCRTask))
+                assets = (
+                    await check_session.scalars(
+                        select(UploadedAsset).where(UploadedAsset.user_id == user_id)
+                    )
+                ).all()
+            assert task is not None
+            assert task.status == "succeeded"
+            assert task.normalized_result_json is not None
+            generated = [asset for asset in assets if asset.id != source.id]
+            assert generated
+            assert all(
+                (settings.upload_dir / asset.storage_name).is_file()
+                for asset in generated
+            )
+
+            async with factory() as retry_session:
+                cached = await service.recognize(
+                    retry_session,
+                    user_id=user_id,
+                    asset=source,
+                    pdf_page_number=1,
+                    local_request_id="ambiguous-commit-retry",
+                )
+            assert cached.question_count == 1
+            assert provider.calls == 1
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())

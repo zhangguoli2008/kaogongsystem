@@ -62,10 +62,10 @@ class DualWindowRateLimiter:
         self._lock = Lock()
 
     def allow(self, key: str) -> bool:
-        now = self._clock()
-        minute_cutoff = now - 60.0
-        hour_cutoff = now - 3600.0
         with self._lock:
+            now = self._clock()
+            minute_cutoff = now - 60.0
+            hour_cutoff = now - 3600.0
             self._prune_expired_keys(hour_cutoff)
             attempts = self._attempts.get(key)
             if attempts is None:

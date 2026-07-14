@@ -274,14 +274,15 @@ def save_generated_png(
     *,
     upload_dir: Path,
     original_name: str,
+    storage_name: str | None = None,
 ) -> StoredGeneratedPNG:
     """Validate and safely persist a server-generated PNG crop."""
 
     mime_type, extension = inspect_image(raw)
     if mime_type != "image/png" or extension != ".png":
         raise InvalidImage
-    storage_name = f"{uuid4().hex}.png"
-    target = image_path(upload_dir, storage_name)
+    resolved_storage_name = storage_name or f"{uuid4().hex}.png"
+    target = image_path(upload_dir, resolved_storage_name)
     upload_dir.mkdir(parents=True, exist_ok=True)
     try:
         target.write_bytes(raw)
@@ -289,7 +290,7 @@ def save_generated_png(
         target.unlink(missing_ok=True)
         raise
     return StoredGeneratedPNG(
-        storage_name=storage_name,
+        storage_name=resolved_storage_name,
         original_name=original_name,
         size_bytes=len(raw),
     )

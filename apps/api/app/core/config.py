@@ -67,6 +67,10 @@ class Settings(BaseSettings):
     tencentcloud_ocr_max_retries: int = 2
     ocr_rate_limit_per_minute: int = 5
     ocr_rate_limit_per_hour: int = 50
+    ocr_corrected_image_max_bytes: int = 10 * 1024 * 1024
+    ocr_corrected_images_max_total_bytes: int = 10 * 1024 * 1024
+    ocr_crop_max_artifacts: int = 100
+    ocr_crop_max_total_png_bytes: int = 10 * 1024 * 1024
     upload_dir: Path = Path("/data/uploads")
     max_upload_bytes: int = 10 * 1024 * 1024
     allowed_origins: list[str] = ["http://localhost:3000"]
