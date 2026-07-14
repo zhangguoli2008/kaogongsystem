@@ -269,6 +269,9 @@ def test_flattens_multiple_question_infos_in_local_order() -> None:
         ("第1题", "1"),
         ("01.", "01"),
         ("101.", "101"),
+        ("3.14", None),
+        ("2026.07", None),
+        ("3．14", None),
         ("题号未知", None),
     ],
 )
@@ -327,6 +330,10 @@ def test_maps_only_explicit_tencent_question_types(
         ("(G)庚", "G", "庚"),
         ("（H）辛", "H", "辛"),
         ("Ｉ．壬", "I", "壬"),
+        ("A)癸", "A", "癸"),
+        ("B）子", "B", "子"),
+        ("Ｃ)丑", "C", "丑"),
+        ("Ｄ）寅", "D", "寅"),
     ],
 )
 def test_parses_supported_option_labels_without_changing_body(
@@ -500,6 +507,27 @@ def test_ignores_empty_groups_and_raises_when_no_valid_question_remains() -> Non
 
     with pytest.raises(NoQuestionDetected, match="未识别到有效题目"):
         normalize(response())
+
+    with pytest.raises(NoQuestionDetected, match="未识别到有效题目"):
+        normalize(
+            Response.model_validate(
+                {"QuestionInfo": None, "RequestId": "request-null-info"}
+            )
+        )
+
+
+def test_blank_options_do_not_make_an_otherwise_empty_group_valid() -> None:
+    blank_options = result_list(
+        Question=[],
+        Option=[element("", index=0), element(None, index=1)],
+        Figure=[],
+        Table=[],
+        Answer=[],
+        Parse=[],
+    )
+
+    with pytest.raises(NoQuestionDetected, match="未识别到有效题目"):
+        normalize(response(question_info([blank_options])))
 
 
 def test_final_schema_cannot_leak_provider_payload_or_future_answer_fields() -> None:

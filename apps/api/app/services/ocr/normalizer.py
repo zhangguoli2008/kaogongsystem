@@ -34,10 +34,10 @@ _QUESTION_TYPE_MAP: dict[str, OcrQuestionType] = {
 _QUESTION_NUMBER_PATTERNS = (
     re.compile(r"^\s*第(?P<number>\d+)题"),
     re.compile(r"^\s*[（(](?P<number>\d+)[）)]"),
-    re.compile(r"^\s*(?P<number>\d+)[.、．）]"),
+    re.compile(r"^\s*(?P<number>\d+)(?:[.．](?!\d)|[、）])"),
 )
 _OPTION_WITH_DELIMITER = re.compile(
-    r"^\s*(?P<label>[A-Za-zＡ-Ｚａ-ｚ])(?:[.、．:：]|\s)+(?P<text>.*)$",
+    r"^\s*(?P<label>[A-Za-zＡ-Ｚａ-ｚ])(?:[.、．:：)）]|\s)+(?P<text>.*)$",
     re.DOTALL,
 )
 _OPTION_WITH_PARENS = re.compile(
@@ -164,7 +164,10 @@ def _normalize_question(
     has_question_text = any(
         value.text is not None and bool(value.text.strip()) for value in question_items
     )
-    if not (has_question_text or option_items or figure_items or table_items):
+    has_option_text = any(
+        value.text is not None and bool(value.text.strip()) for value in option_items
+    )
+    if not (has_question_text or has_option_text or figure_items or table_items):
         return None
 
     warnings: list[str] = []
@@ -229,7 +232,7 @@ def normalize_question_split_response(
     """Normalize one Tencent response without retaining its source image bytes."""
 
     questions: list[OcrQuestion] = []
-    for source_info_index, info in enumerate(raw_model.question_info):
+    for source_info_index, info in enumerate(raw_model.question_info or []):
         for raw_question in info.result_list or []:
             question = _normalize_question(
                 raw_question,

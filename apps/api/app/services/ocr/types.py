@@ -55,7 +55,5 @@ class QuestionInfo(TencentModel):
 
 
 class Response(TencentModel):
-    question_info: list[QuestionInfo] = Field(
-        default_factory=list, alias="QuestionInfo"
-    )
+    question_info: list[QuestionInfo] | None = Field(default=None, alias="QuestionInfo")
     request_id: str = Field(alias="RequestId")
