@@ -209,6 +209,8 @@ def test_normalizes_official_single_question_shape_without_semantic_rewrites() -
                 "right_bottom": {"x": 15, "y": 16},
                 "left_bottom": {"x": 17, "y": 18},
             },
+            "asset_id": None,
+            "image_url": None,
         },
         {
             "label": "B",
@@ -220,6 +222,8 @@ def test_normalizes_official_single_question_shape_without_semantic_rewrites() -
                 "right_bottom": {"x": 25, "y": 26},
                 "left_bottom": {"x": 27, "y": 28},
             },
+            "asset_id": None,
+            "image_url": None,
         },
     ]
     assert question.recognized_answer == "A"

@@ -34,6 +34,8 @@ class OcrOption(OcrModel):
     text: str
     raw_text: str
     coord: OcrPolygon | None = None
+    asset_id: str | None = None
+    image_url: str | None = None
 
 
 class OcrMedia(OcrModel):
@@ -80,6 +82,8 @@ class OcrQuestion(OcrModel):
     coord: list[OcrPolygon] = Field(default_factory=list)
     raw_group_type: str | None = None
     warnings: list[str] = Field(default_factory=list)
+    crop_asset_id: str | None = None
+    crop_image_url: str | None = None
 
 
 class OcrResult(OcrModel):

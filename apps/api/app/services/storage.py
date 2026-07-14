@@ -95,6 +95,13 @@ class StoredUpload:
         yield self.size_bytes
 
 
+@dataclass(frozen=True)
+class StoredGeneratedPNG:
+    storage_name: str
+    original_name: str
+    size_bytes: int
+
+
 def _quality_warnings(image: Image.Image) -> tuple[str, ...]:
     warnings_found: list[str] = []
     short_side, long_side = sorted(image.size)
@@ -195,6 +202,14 @@ def _inspect_file(raw: bytes) -> FileInspection:
     raise UnsupportedImageType
 
 
+def inspect_file(raw: bytes) -> FileInspection:
+    """Fully decode a stored upload and return canonical content metadata."""
+
+    if not raw:
+        raise EmptyFile
+    return _inspect_file(raw)
+
+
 async def save_image(
     file: UploadFile,
     *,
@@ -252,3 +267,29 @@ def image_path(upload_dir: Path, storage_name: str) -> Path:
     if candidate.parent != root or candidate.name != storage_name:
         raise ValueError("invalid storage name")
     return candidate
+
+
+def save_generated_png(
+    raw: bytes,
+    *,
+    upload_dir: Path,
+    original_name: str,
+) -> StoredGeneratedPNG:
+    """Validate and safely persist a server-generated PNG crop."""
+
+    mime_type, extension = inspect_image(raw)
+    if mime_type != "image/png" or extension != ".png":
+        raise InvalidImage
+    storage_name = f"{uuid4().hex}.png"
+    target = image_path(upload_dir, storage_name)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        target.write_bytes(raw)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    return StoredGeneratedPNG(
+        storage_name=storage_name,
+        original_name=original_name,
+        size_bytes=len(raw),
+    )

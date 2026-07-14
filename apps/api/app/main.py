@@ -9,6 +9,8 @@ from app.core.database import create_session_factory
 from app.core.errors import UnexpectedErrorMiddleware, install_error_handlers
 from app.core.rate_limit import RateLimiter
 from app.core.readiness import ReadinessError, probe_readiness
+from app.services.ocr.factory import create_ocr_provider
+from app.services.ocr.service import OCRService
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -25,6 +27,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Keep provider throttling separate so future analysis calls can share the
     # same bounded state without affecting authentication limits.
     app.state.provider_rate_limiter = RateLimiter(limit=10, window_seconds=60)
+    app.state.ocr_provider = create_ocr_provider(resolved)
+    app.state.ocr_service = OCRService(app.state.ocr_provider, resolved)
     app.add_middleware(UnexpectedErrorMiddleware)
     if resolved.allowed_hosts != ["*"]:
         app.add_middleware(
