@@ -1,8 +1,19 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.question import ErrorReason, ExamModule, QuestionOption
+
+
+class AnalysisImage(BaseModel):
+    """Transient image bytes passed to a provider but never serialized."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    mime_type: Literal["image/jpeg", "image/png"]
+    content: bytes = Field(min_length=1, exclude=True, repr=False)
 
 
 class AnalysisInput(BaseModel):

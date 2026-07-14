@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+from typing import Annotated
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.common import Pagination
+from app.schemas.ocr import OcrPolygon, OcrQuestionType
 
 
 class ExamType(str, Enum):
@@ -51,6 +54,65 @@ class QuestionOption(BaseModel):
     content: str = Field(min_length=1, max_length=2000)
 
 
+class QuestionOcrAsset(BaseModel):
+    """A user-owned upload reference; the API always derives ``image_url``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    asset_id: UUID
+    image_url: str | None = Field(default=None, max_length=1000)
+
+
+class QuestionOcrMedia(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    index: int | None = None
+    text: str | None = Field(default=None, max_length=50000)
+    coord: OcrPolygon | None = None
+    asset: QuestionOcrAsset | None = None
+
+
+class QuestionOcrOptionMedia(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field(min_length=1, max_length=4)
+    coord: OcrPolygon | None = None
+    asset: QuestionOcrAsset | None = None
+
+
+class QuestionOcrTextElement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    index: int | None = None
+    text: str | None = Field(default=None, max_length=20000)
+    coord: OcrPolygon | None = None
+
+
+OcrWarning = Annotated[str, Field(min_length=1, max_length=1000)]
+
+
+class QuestionOcrMetadata(BaseModel):
+    """Strict OCR provenance kept separate from user-confirmed question fields."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: QuestionOcrAsset
+    question_number: str | None = Field(default=None, max_length=100)
+    question_type: OcrQuestionType
+    full_text: str = Field(max_length=50000)
+    question_elements: list[QuestionOcrTextElement] = Field(
+        default_factory=list, max_length=500
+    )
+    coord: list[OcrPolygon] = Field(default_factory=list, max_length=100)
+    crop: QuestionOcrAsset | None = None
+    figures: list[QuestionOcrMedia] = Field(default_factory=list, max_length=100)
+    tables: list[QuestionOcrMedia] = Field(default_factory=list, max_length=100)
+    options: list[QuestionOcrOptionMedia] = Field(default_factory=list, max_length=26)
+    recognized_answer: str | None = Field(default=None, max_length=20000)
+    recognized_parse: str | None = Field(default=None, max_length=50000)
+    warnings: list[OcrWarning] = Field(default_factory=list, max_length=100)
+
+
 class QuestionCreate(BaseModel):
     exam_type: ExamType
     module: ExamModule
@@ -63,6 +125,7 @@ class QuestionCreate(BaseModel):
     notes: str | None = Field(default=None, max_length=20000)
     image_path: str | None = Field(default=None, max_length=1000)
     ocr_raw_text: str | None = Field(default=None, max_length=50000)
+    ocr_metadata: QuestionOcrMetadata | None = None
     knowledge_points: list[str] = Field(default_factory=list, max_length=100)
     error_reason: ErrorReason | None = None
     mastery_status: MasteryStatus = MasteryStatus.UNMASTERED
@@ -82,6 +145,7 @@ class QuestionUpdate(BaseModel):
     notes: str | None = Field(default=None, max_length=20000)
     image_path: str | None = Field(default=None, max_length=1000)
     ocr_raw_text: str | None = Field(default=None, max_length=50000)
+    ocr_metadata: QuestionOcrMetadata | None = None
     knowledge_points: list[str] | None = Field(default=None, max_length=100)
     error_reason: ErrorReason | None = None
     mastery_status: MasteryStatus | None = None

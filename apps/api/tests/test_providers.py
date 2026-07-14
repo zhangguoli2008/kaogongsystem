@@ -6,6 +6,7 @@ import httpx
 import pytest
 from openai import APIConnectionError
 
+from app.schemas import analysis as analysis_schemas
 from app.core.errors import APIError
 from app.core.errors import request_id_for
 from app.schemas.analysis import AnalysisInput, AnalysisResult
@@ -78,6 +79,28 @@ def test_demo_provider_returns_deterministic_structured_analysis():
     assert first.knowledge_points
     assert first.cause_analysis
     assert first.correct_approach
+
+
+def test_demo_provider_ignores_visual_inputs():
+    without_images = asyncio.run(DemoProvider().analyze(analysis_input()))
+    with_images = asyncio.run(
+        DemoProvider().analyze(
+            analysis_input(),
+            images=[SimpleNamespace(mime_type="image/png", content=b"private-image")],
+        )
+    )
+
+    assert with_images == without_images
+
+
+def test_analysis_image_never_serializes_or_reprs_private_bytes():
+    assert hasattr(analysis_schemas, "AnalysisImage")
+    image_type = analysis_schemas.AnalysisImage
+    image = image_type(mime_type="image/png", content=b"private-image-bytes")
+
+    assert image.model_dump() == {"mime_type": "image/png"}
+    assert "private-image-bytes" not in repr(image)
+    assert "private-image-bytes" not in image.model_dump_json()
 
 
 def test_demo_provider_returns_deterministic_analytics_advice():
@@ -193,6 +216,58 @@ def test_openai_provider_analyze_uses_strict_schema_and_keeps_raw_response():
     assert seen["text"]["format"]["strict"] is True
     assert seen["text"]["format"]["schema"]["additionalProperties"] is False
     assert "suggested_error_reason" in seen["text"]["format"]["schema"]["required"]
+    assert seen["input"][0]["content"] == [
+        {"type": "input_text", "text": analysis_input().model_dump_json()}
+    ]
+
+
+def test_openai_provider_analyze_sends_images_separately_from_text_json():
+    seen = {}
+    raw_response = {
+        "cause_analysis": "忽略了图表信息。",
+        "knowledge_points": ["资料分析"],
+        "correct_approach": "结合图表核验。",
+        "study_advice": "练习读图。",
+        "suggested_error_reason": "理解错",
+    }
+
+    class FakeResponses:
+        async def create(self, **kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(output_text=__import__("json").dumps(raw_response))
+
+    class FakeClient:
+        responses = FakeResponses()
+
+    provider = OpenAIProvider(api_key="test", model="test-model", client=FakeClient())
+    images = [
+        SimpleNamespace(mime_type="image/png", content=b"first-private-image"),
+        SimpleNamespace(mime_type="image/jpeg", content=b"second-private-image"),
+    ]
+    result = asyncio.run(
+        provider.analyze(analysis_input(), images=images, request_id="local-images")
+    )
+
+    assert result.provider_name == "openai"
+    content = seen["input"][0]["content"]
+    assert content[0] == {
+        "type": "input_text",
+        "text": analysis_input().model_dump_json(),
+    }
+    assert content[1:] == [
+        {
+            "type": "input_image",
+            "image_url": "data:image/png;base64,"
+            + base64.b64encode(b"first-private-image").decode(),
+        },
+        {
+            "type": "input_image",
+            "image_url": "data:image/jpeg;base64,"
+            + base64.b64encode(b"second-private-image").decode(),
+        },
+    ]
+    assert "data:image" not in content[0]["text"]
+    assert "first-private-image" not in content[0]["text"]
 
 
 def test_openai_provider_advice_uses_server_payload_and_strict_schema():

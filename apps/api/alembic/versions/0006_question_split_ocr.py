@@ -13,6 +13,10 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    op.add_column(
+        "questions",
+        sa.Column("ocr_metadata", sa.JSON(), nullable=True),
+    )
     op.create_table(
         "ocr_tasks",
         sa.Column("id", sa.String(length=36), nullable=False),
@@ -64,3 +68,4 @@ def downgrade() -> None:
     op.drop_index("ix_ocr_tasks_user_id", table_name="ocr_tasks")
     op.drop_index("ix_ocr_tasks_source_file_id", table_name="ocr_tasks")
     op.drop_table("ocr_tasks")
+    op.drop_column("questions", "ocr_metadata")

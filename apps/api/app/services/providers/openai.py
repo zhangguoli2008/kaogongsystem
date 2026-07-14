@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Sequence
 import logging
 from typing import Any
 
@@ -14,6 +15,7 @@ from openai import (
 
 from app.core.errors import APIError
 from app.schemas.analysis import (
+    AnalysisImage,
     AnalysisInput,
     AnalysisProviderResponse,
     AnalysisResult,
@@ -34,6 +36,7 @@ OCR_INSTRUCTIONS = (
 
 ANALYSIS_INSTRUCTIONS = (
     "分析这道公考错题的错误原因、知识点、正确思路和学习建议。"
+    "如果同时提供题目或图表图片，请结合图片中的视觉信息分析。"
     "仅返回指定 JSON 结构，不要添加额外字段。"
 )
 
@@ -171,9 +174,27 @@ class OpenAIProvider:
         )
 
     async def analyze(
-        self, payload: AnalysisInput, request_id: str | None = None
+        self,
+        payload: AnalysisInput,
+        request_id: str | None = None,
+        *,
+        images: Sequence[AnalysisImage] = (),
     ) -> AnalysisResult:
         local_request_id = request_id or self.request_id
+        content: list[dict[str, str]] = [
+            {
+                "type": "input_text",
+                "text": payload.model_dump_json(),
+            }
+        ]
+        for image in images:
+            encoded = base64.b64encode(image.content).decode()
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": f"data:{image.mime_type};base64,{encoded}",
+                }
+            )
         try:
             response = await self.client.responses.create(
                 model=self.model,
@@ -181,12 +202,7 @@ class OpenAIProvider:
                 input=[
                     {
                         "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": payload.model_dump_json(),
-                            }
-                        ],
+                        "content": content,
                     }
                 ],
                 text={

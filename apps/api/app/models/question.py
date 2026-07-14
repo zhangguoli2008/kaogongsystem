@@ -39,6 +39,7 @@ class Question(TimestampMixin, Base):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     image_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     ocr_raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ocr_metadata: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
     knowledge_points: Mapped[list[str]] = mapped_column(
         JSON, nullable=False, default=list, server_default="[]"
     )

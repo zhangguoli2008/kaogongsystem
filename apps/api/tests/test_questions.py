@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import asyncio
+from io import BytesIO
+import json
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -13,6 +17,7 @@ from app.core.errors import APIError
 from app.main import create_app
 from app.models.analysis import Analysis
 from app.models.base import Base
+from app.models.question import Question
 from app.models.review import UserSettings  # noqa: F401
 from app.models.user import User  # noqa: F401
 from app.schemas.analysis import AnalysisResult
@@ -77,6 +82,51 @@ def create_question(client, cookies, **overrides):
     return response.json()
 
 
+def upload_question_image(
+    client,
+    cookies,
+    *,
+    color: str = "white",
+    image_format: str = "PNG",
+) -> dict:
+    output = BytesIO()
+    Image.new("RGB", (32, 32), color=color).save(output, format=image_format)
+    suffix = image_format.casefold()
+    response = client.post(
+        "/api/v1/uploads/questions",
+        cookies=cookies,
+        files={
+            "file": (
+                f"question.{suffix}",
+                output.getvalue(),
+                f"image/{suffix}",
+            )
+        },
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def ocr_metadata(source_asset_id: str, **overrides) -> dict:
+    metadata = {
+        "source": {"asset_id": source_asset_id},
+        "question_number": "12",
+        "question_type": "multiple_choice_unknown",
+        "full_text": "12. OCR 识别原文",
+        "question_elements": [],
+        "coord": [],
+        "crop": None,
+        "figures": [],
+        "tables": [],
+        "options": [],
+        "recognized_answer": "C",
+        "recognized_parse": "OCR 从图片中识别出的解析",
+        "warnings": [],
+    }
+    metadata.update(overrides)
+    return metadata
+
+
 def test_question_and_analysis_tables_register_with_api_router():
     assert {"questions", "analyses"}.issubset(Base.metadata.tables)
 
@@ -107,6 +157,224 @@ def test_question_crud_has_defaults_and_updates(client):
     deleted = client.delete(f"/api/v1/questions/{question_id}", cookies=cookies)
     assert deleted.status_code == 204
     assert client.get(f"/api/v1/questions/{question_id}", cookies=cookies).status_code == 404
+
+
+def test_question_persists_strict_ocr_metadata_with_server_derived_urls(client):
+    cookies = register(client, "ocr-metadata@example.com")
+    source = upload_question_image(client, cookies)
+    crop = upload_question_image(client, cookies, color="red")
+    figure = upload_question_image(client, cookies, color="green")
+    table = upload_question_image(client, cookies, color="blue")
+    option = upload_question_image(client, cookies, color="yellow")
+
+    created = create_question(
+        client,
+        cookies,
+        correct_answer="B",
+        original_explanation="用户确认的解析",
+        ocr_metadata=ocr_metadata(
+            source["id"],
+            crop={"asset_id": crop["id"]},
+            figures=[
+                {
+                    "index": 1,
+                    "text": "图形材料",
+                    "coord": None,
+                    "asset": {"asset_id": figure["id"]},
+                }
+            ],
+            tables=[
+                {
+                    "index": 2,
+                    "text": "统计表",
+                    "coord": None,
+                    "asset": {"asset_id": table["id"]},
+                }
+            ],
+            options=[
+                {
+                    "label": "A",
+                    "coord": None,
+                    "asset": {"asset_id": option["id"]},
+                }
+            ],
+        ),
+    )
+
+    metadata = created["ocr_metadata"]
+    assert metadata["source"] == {
+        "asset_id": source["id"],
+        "image_url": f"/uploads/{source['id']}",
+    }
+    assert metadata["crop"]["image_url"] == f"/uploads/{crop['id']}"
+    assert metadata["figures"][0]["asset"]["image_url"] == f"/uploads/{figure['id']}"
+    assert metadata["tables"][0]["asset"]["image_url"] == f"/uploads/{table['id']}"
+    assert metadata["options"][0]["asset"]["image_url"] == f"/uploads/{option['id']}"
+    assert created["correct_answer"] == "B"
+    assert created["original_explanation"] == "用户确认的解析"
+    assert metadata["recognized_answer"] == "C"
+    assert metadata["recognized_parse"] == "OCR 从图片中识别出的解析"
+
+    serialized = json.dumps(created, ensure_ascii=False)
+    assert str(client.app.state.settings.upload_dir) not in serialized
+    assert "storage_name" not in serialized
+    assert "base64" not in serialized.casefold()
+
+
+@pytest.mark.parametrize("reference_kind", ["source", "crop", "figure", "table", "option"])
+def test_question_rejects_every_foreign_ocr_asset_reference(client, reference_kind):
+    owner = register(client, f"ocr-owner-{reference_kind}@example.com")
+    owner_source = upload_question_image(client, owner)
+    other = register(client, f"ocr-other-{reference_kind}@example.com")
+    foreign = upload_question_image(client, other)
+    metadata = ocr_metadata(owner_source["id"])
+    if reference_kind == "source":
+        metadata["source"] = {"asset_id": foreign["id"]}
+    elif reference_kind == "crop":
+        metadata["crop"] = {"asset_id": foreign["id"]}
+    elif reference_kind == "figure":
+        metadata["figures"] = [
+            {"index": 0, "text": None, "coord": None, "asset": {"asset_id": foreign["id"]}}
+        ]
+    elif reference_kind == "table":
+        metadata["tables"] = [
+            {"index": 0, "text": None, "coord": None, "asset": {"asset_id": foreign["id"]}}
+        ]
+    else:
+        metadata["options"] = [
+            {"label": "A", "coord": None, "asset": {"asset_id": foreign["id"]}}
+        ]
+
+    response = client.post(
+        "/api/v1/questions",
+        cookies=owner,
+        json=question_payload(ocr_metadata=metadata),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "invalid_ocr_asset_reference"
+    assert foreign["id"] not in response.text
+
+
+def test_question_rejects_missing_and_malformed_ocr_asset_references(client):
+    cookies = register(client, "ocr-invalid-reference@example.com")
+    source = upload_question_image(client, cookies)
+
+    missing = client.post(
+        "/api/v1/questions",
+        cookies=cookies,
+        json=question_payload(ocr_metadata=ocr_metadata(str(uuid4()))),
+    )
+    malformed_url = client.post(
+        "/api/v1/questions",
+        cookies=cookies,
+        json=question_payload(
+            ocr_metadata=ocr_metadata(
+                source["id"],
+                crop={
+                    "asset_id": source["id"],
+                    "image_url": "https://untrusted.example/image.png",
+                },
+            )
+        ),
+    )
+    extra_field = client.post(
+        "/api/v1/questions",
+        cookies=cookies,
+        json=question_payload(
+            ocr_metadata={**ocr_metadata(source["id"]), "untrusted": "value"}
+        ),
+    )
+
+    assert missing.status_code == 422
+    assert missing.json()["code"] == "invalid_ocr_asset_reference"
+    assert malformed_url.status_code == 422
+    assert malformed_url.json()["code"] == "invalid_ocr_asset_reference"
+    assert extra_field.status_code == 422
+    assert extra_field.json()["code"] == "validation_error"
+
+
+def test_question_rejects_oversized_persisted_ocr_text_element(client):
+    cookies = register(client, "ocr-text-bound@example.com")
+    source = upload_question_image(client, cookies)
+    metadata = ocr_metadata(source["id"])
+    metadata["question_elements"] = [
+        {"index": 0, "text": "字" * 20001, "coord": None}
+    ]
+
+    response = client.post(
+        "/api/v1/questions",
+        cookies=cookies,
+        json=question_payload(ocr_metadata=metadata),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "validation_error"
+
+
+def test_updating_recognized_answer_and_parse_never_overwrites_confirmed_fields(client):
+    cookies = register(client, "ocr-answer-boundary@example.com")
+    source = upload_question_image(client, cookies)
+    created = create_question(
+        client,
+        cookies,
+        correct_answer="B",
+        original_explanation="用户确认的原解析",
+        ocr_metadata=ocr_metadata(source["id"]),
+    )
+
+    updated_metadata = {
+        **created["ocr_metadata"],
+        "recognized_answer": "D",
+        "recognized_parse": "更新后的 OCR 解析",
+    }
+    response = client.patch(
+        f"/api/v1/questions/{created['id']}",
+        cookies=cookies,
+        json={"ocr_metadata": updated_metadata},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["correct_answer"] == "B"
+    assert response.json()["original_explanation"] == "用户确认的原解析"
+    assert response.json()["ocr_metadata"]["recognized_answer"] == "D"
+    assert response.json()["ocr_metadata"]["recognized_parse"] == "更新后的 OCR 解析"
+
+
+def test_question_update_rejects_foreign_ocr_asset_reference(client):
+    owner = register(client, "ocr-update-owner@example.com")
+    owner_source = upload_question_image(client, owner)
+    created = create_question(client, owner)
+    other = register(client, "ocr-update-other@example.com")
+    foreign = upload_question_image(client, other)
+
+    response = client.patch(
+        f"/api/v1/questions/{created['id']}",
+        cookies=owner,
+        json={
+            "ocr_metadata": ocr_metadata(
+                owner_source["id"], crop={"asset_id": foreign["id"]}
+            )
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "invalid_ocr_asset_reference"
+
+
+def test_question_rejects_ocr_asset_whose_backing_file_is_missing(client):
+    cookies = register(client, "ocr-file-missing@example.com")
+    source = upload_question_image(client, cookies)
+    (client.app.state.settings.upload_dir / source["storage_name"]).unlink()
+
+    response = client.post(
+        "/api/v1/questions",
+        cookies=cookies,
+        json=question_payload(ocr_metadata=ocr_metadata(source["id"])),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "invalid_ocr_asset_reference"
 
 
 @pytest.mark.parametrize("field", ["stem", "module"])
@@ -284,6 +552,231 @@ def test_manual_analysis_persists_structured_result(client):
     assert detail.json()["analysis_status"] == "已完成"
     assert detail.json()["analysis_error_code"] is None
     assert detail.json()["current_analysis"]["id"] == analysis["id"]
+
+
+def test_analysis_loads_owned_visual_bytes_by_storage_name_and_deduplicates(
+    client, monkeypatch
+):
+    cookies = register(client, "analysis-images@example.com")
+    source = upload_question_image(client, cookies, color="purple")
+    question = create_question(
+        client,
+        cookies,
+        ocr_metadata=ocr_metadata(
+            source["id"],
+            crop={"asset_id": source["id"]},
+            figures=[
+                {
+                    "index": 0,
+                    "text": None,
+                    "coord": None,
+                    "asset": {"asset_id": source["id"]},
+                }
+            ],
+        ),
+    )
+    expected = (client.app.state.settings.upload_dir / source["storage_name"]).read_bytes()
+    seen = {}
+
+    class CapturingProvider:
+        async def analyze(self, payload, images=(), request_id=None):
+            seen["payload"] = payload
+            seen["images"] = list(images)
+            return await DemoProvider().analyze(payload, images=images, request_id=request_id)
+
+    monkeypatch.setattr(
+        "app.api.routes.questions.get_provider", lambda settings: CapturingProvider()
+    )
+    response = client.post(
+        f"/api/v1/questions/{question['id']}/analyze", cookies=cookies
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(seen["images"]) == 1
+    assert seen["images"][0].mime_type == "image/png"
+    assert seen["images"][0].content == expected
+    assert "ocr_metadata" not in seen["payload"].model_dump()
+    assert "base64" not in seen["payload"].model_dump_json().casefold()
+
+
+def test_analysis_applies_visual_count_and_total_byte_budgets(client, monkeypatch):
+    cookies = register(client, "analysis-image-budget@example.com")
+    source = upload_question_image(client, cookies, color="red")
+    crop = upload_question_image(client, cookies, color="green")
+    figure = upload_question_image(client, cookies, color="blue")
+    question = create_question(
+        client,
+        cookies,
+        ocr_metadata=ocr_metadata(
+            source["id"],
+            crop={"asset_id": crop["id"]},
+            figures=[
+                {
+                    "index": 0,
+                    "text": None,
+                    "coord": None,
+                    "asset": {"asset_id": figure["id"]},
+                }
+            ],
+        ),
+    )
+    captured_images: list[list[bytes]] = []
+
+    class CapturingProvider:
+        async def analyze(self, payload, images=(), request_id=None):
+            captured_images.append([image.content for image in images])
+            return await DemoProvider().analyze(payload, images=images, request_id=request_id)
+
+    monkeypatch.setattr(
+        "app.api.routes.questions.get_provider", lambda settings: CapturingProvider()
+    )
+    monkeypatch.setattr("app.api.routes.questions.MAX_ANALYSIS_IMAGES", 2, raising=False)
+    monkeypatch.setattr(
+        "app.api.routes.questions.MAX_ANALYSIS_IMAGE_TOTAL_BYTES",
+        100 * 1024 * 1024,
+        raising=False,
+    )
+    first = client.post(
+        f"/api/v1/questions/{question['id']}/analyze", cookies=cookies
+    )
+
+    monkeypatch.setattr("app.api.routes.questions.MAX_ANALYSIS_IMAGES", 8, raising=False)
+    monkeypatch.setattr(
+        "app.api.routes.questions.MAX_ANALYSIS_IMAGE_TOTAL_BYTES",
+        crop["size_bytes"],
+        raising=False,
+    )
+    second = client.post(
+        f"/api/v1/questions/{question['id']}/analyze", cookies=cookies
+    )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    source_bytes = (
+        client.app.state.settings.upload_dir / source["storage_name"]
+    ).read_bytes()
+    crop_bytes = (
+        client.app.state.settings.upload_dir / crop["storage_name"]
+    ).read_bytes()
+    figure_bytes = (
+        client.app.state.settings.upload_dir / figure["storage_name"]
+    ).read_bytes()
+    assert captured_images[0] == [crop_bytes, figure_bytes]
+    assert captured_images[1] == [crop_bytes]
+    assert source_bytes not in captured_images[0]
+
+
+def test_analysis_revalidates_visual_asset_ownership_in_persisted_metadata(
+    client, monkeypatch
+):
+    owner = register(client, "analysis-visual-owner@example.com")
+    owner_source = upload_question_image(client, owner)
+    question = create_question(
+        client, owner, ocr_metadata=ocr_metadata(owner_source["id"])
+    )
+    other = register(client, "analysis-visual-other@example.com")
+    foreign = upload_question_image(client, other)
+
+    async def corrupt_metadata() -> None:
+        async with client.app.state.session_factory() as session:
+            stored = await session.get(Question, question["id"])
+            assert stored is not None
+            stored.ocr_metadata = ocr_metadata(foreign["id"])
+            await session.commit()
+
+    asyncio.run(corrupt_metadata())
+
+    class MustNotRunProvider:
+        async def analyze(self, payload, images=(), request_id=None):
+            raise AssertionError("provider must not receive a foreign visual asset")
+
+    monkeypatch.setattr(
+        "app.api.routes.questions.get_provider", lambda settings: MustNotRunProvider()
+    )
+    response = client.post(
+        f"/api/v1/questions/{question['id']}/analyze", cookies=owner
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "invalid_ocr_asset_reference"
+    assert foreign["id"] not in response.text
+
+
+def test_analysis_rejects_visual_asset_missing_from_controlled_storage(client, monkeypatch):
+    cookies = register(client, "analysis-visual-missing@example.com")
+    source = upload_question_image(client, cookies)
+    question = create_question(
+        client, cookies, ocr_metadata=ocr_metadata(source["id"])
+    )
+    (client.app.state.settings.upload_dir / source["storage_name"]).unlink()
+
+    class MustNotRunProvider:
+        async def analyze(self, payload, images=(), request_id=None):
+            raise AssertionError("provider must not run with a missing visual asset")
+
+    monkeypatch.setattr(
+        "app.api.routes.questions.get_provider", lambda settings: MustNotRunProvider()
+    )
+    response = client.post(
+        f"/api/v1/questions/{question['id']}/analyze", cookies=cookies
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "invalid_ocr_asset_reference"
+
+
+def test_analysis_redecodes_stored_image_and_rejects_corrupted_content(
+    client, monkeypatch
+):
+    cookies = register(client, "analysis-visual-corrupt@example.com")
+    source = upload_question_image(client, cookies)
+    question = create_question(
+        client, cookies, ocr_metadata=ocr_metadata(source["id"])
+    )
+    (client.app.state.settings.upload_dir / source["storage_name"]).write_bytes(
+        b"not-an-image"
+    )
+
+    class MustNotRunProvider:
+        async def analyze(self, payload, images=(), request_id=None):
+            raise AssertionError("provider must not receive corrupted image bytes")
+
+    monkeypatch.setattr(
+        "app.api.routes.questions.get_provider", lambda settings: MustNotRunProvider()
+    )
+    response = client.post(
+        f"/api/v1/questions/{question['id']}/analyze", cookies=cookies
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "invalid_ocr_asset_reference"
+
+
+def test_analysis_converts_verified_bmp_to_bounded_png_input(client, monkeypatch):
+    cookies = register(client, "analysis-visual-bmp@example.com")
+    source = upload_question_image(client, cookies, color="orange", image_format="BMP")
+    question = create_question(
+        client, cookies, ocr_metadata=ocr_metadata(source["id"])
+    )
+    seen = {}
+
+    class CapturingProvider:
+        async def analyze(self, payload, images=(), request_id=None):
+            seen["images"] = list(images)
+            return await DemoProvider().analyze(payload, images=images, request_id=request_id)
+
+    monkeypatch.setattr(
+        "app.api.routes.questions.get_provider", lambda settings: CapturingProvider()
+    )
+    response = client.post(
+        f"/api/v1/questions/{question['id']}/analyze", cookies=cookies
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(seen["images"]) == 1
+    assert seen["images"][0].mime_type == "image/png"
+    with Image.open(BytesIO(seen["images"][0].content)) as converted:
+        assert converted.format == "PNG"
 
 
 def test_reanalysis_keeps_history_and_updates_current_analysis(client):

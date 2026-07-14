@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from app.schemas.analysis import AnalysisInput, AnalysisResult
+from collections.abc import Sequence
+
+from app.schemas.analysis import AnalysisImage, AnalysisInput, AnalysisResult
 from app.schemas.analytics import AnalyticsAdviceInput, AnalyticsAdviceResult
 from app.schemas.question import ErrorReason, ExamModule, QuestionOption
 from app.schemas.upload import OcrResult
@@ -71,9 +73,13 @@ class DemoProvider:
         )
 
     async def analyze(
-        self, payload: AnalysisInput, request_id: str | None = None
+        self,
+        payload: AnalysisInput,
+        request_id: str | None = None,
+        *,
+        images: Sequence[AnalysisImage] = (),
     ) -> AnalysisResult:
-        del request_id
+        del request_id, images
         (
             knowledge_points,
             cause_analysis,
