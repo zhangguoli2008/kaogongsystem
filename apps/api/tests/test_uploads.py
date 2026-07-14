@@ -6,9 +6,10 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi import UploadFile
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter
 import pytest
 from pypdf import PdfWriter
+from pypdf.errors import LimitReachedError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.base import Base
@@ -33,9 +34,38 @@ def png_bytes() -> bytes:
 
 
 def image_bytes(image_format: str, *, size: tuple[int, int] = (640, 800)) -> bytes:
-    image = Image.new("RGB", size, "white")
+    image = clear_question_image(size)
     output = BytesIO()
     image.save(output, format=image_format)
+    return output.getvalue()
+
+
+def clear_question_image(size: tuple[int, int]) -> Image.Image:
+    width, height = size
+    image = Image.new("L", size, 205)
+    draw = ImageDraw.Draw(image)
+    margin = max(20, width // 12)
+    line_height = max(5, height // 100)
+    line_gap = max(24, height // 16)
+    for index, y in enumerate(range(line_gap, height - line_gap, line_gap)):
+        right = width - margin - (index % 3) * max(12, width // 14)
+        draw.rectangle((margin, y, right, y + line_height), fill=35)
+    return image.convert("RGB")
+
+
+def quality_image_bytes(
+    quality: str, *, size: tuple[int, int] = (600, 800)
+) -> bytes:
+    if quality == "dark":
+        image = Image.new("L", size, 15)
+    elif quality == "bright":
+        image = Image.new("L", size, 252)
+    else:
+        image = clear_question_image(size)
+        if quality == "blurry":
+            image = image.filter(ImageFilter.GaussianBlur(radius=12))
+    output = BytesIO()
+    image.save(output, format="PNG")
     return output.getvalue()
 
 
@@ -95,7 +125,70 @@ def test_accepts_supported_images_by_decoded_content(
     assert payload["width"] == 640
     assert payload["height"] == 800
     assert payload["page_count"] is None
-    assert payload["warnings"] == ["图片分辨率较低，可能影响文字识别准确率"]
+    assert payload["warnings"] == []
+
+
+@pytest.mark.parametrize(
+    ("size", "should_warn"),
+    [
+        ((600, 800), False),
+        ((800, 600), False),
+        ((599, 800), True),
+        ((800, 599), True),
+    ],
+)
+def test_resolution_warning_uses_orientation_independent_600_by_800_boundary(
+    client, size, should_warn
+):
+    cookies = register(client, f"upload-resolution-{size[0]}-{size[1]}@example.com")
+    response = client.post(
+        "/api/v1/uploads/questions",
+        cookies=cookies,
+        files={
+            "file": (
+                "question.png",
+                quality_image_bytes("clear", size=size),
+                "image/png",
+            )
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    resolution_warnings = [
+        warning for warning in response.json()["warnings"] if "分辨率" in warning
+    ]
+    assert bool(resolution_warnings) is should_warn
+
+
+@pytest.mark.parametrize(
+    ("quality", "expected_warning"),
+    [
+        ("clear", None),
+        ("blurry", "图片可能模糊，建议重新拍摄或扫描"),
+        ("dark", "图片可能过暗，建议提高光线或亮度"),
+        ("bright", "图片可能过曝，建议避免强光并重新拍摄"),
+    ],
+)
+def test_returns_deterministic_image_quality_warnings(
+    client, quality, expected_warning
+):
+    cookies = register(client, f"upload-quality-{quality}@example.com")
+    response = client.post(
+        "/api/v1/uploads/questions",
+        cookies=cookies,
+        files={"file": ("question.png", quality_image_bytes(quality), "image/png")},
+    )
+
+    assert response.status_code == 201, response.text
+    quality_warnings = [
+        warning
+        for warning in response.json()["warnings"]
+        if any(label in warning for label in ("可能模糊", "可能过暗", "可能过曝"))
+    ]
+    if expected_warning is None:
+        assert quality_warnings == []
+    else:
+        assert expected_warning in quality_warnings
 
 
 def test_accepts_pdf_and_returns_page_count(client):
@@ -197,6 +290,24 @@ def test_rejects_invalid_pdf_with_pdf_signature(client):
         "/api/v1/uploads/questions",
         cookies=cookies,
         files={"file": ("question.pdf", b"%PDF-1.7\ntruncated", "application/pdf")},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "OCR_INVALID_PDF"
+    assert not client.app.state.settings.upload_dir.exists()
+
+
+def test_rejects_pypdf_limit_error_as_invalid_pdf(client, monkeypatch):
+    cookies = register(client, "upload-pdf-limit@example.com")
+
+    def fail_reader(_stream):
+        raise LimitReachedError("object limit reached")
+
+    monkeypatch.setattr("app.services.storage.PdfReader", fail_reader)
+    response = client.post(
+        "/api/v1/uploads/questions",
+        cookies=cookies,
+        files={"file": ("question.pdf", b"%PDF-1.7\n", "application/pdf")},
     )
 
     assert response.status_code == 422

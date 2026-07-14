@@ -10,9 +10,9 @@ from uuid import uuid4
 import warnings
 
 from fastapi import UploadFile
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageChops, ImageFilter, ImageStat, UnidentifiedImageError
 from pypdf import PdfReader
-from pypdf.errors import PdfReadError
+from pypdf.errors import PyPdfError
 
 
 ALLOWED_FORMATS: Final[dict[str, tuple[str, str]]] = {
@@ -22,8 +22,12 @@ ALLOWED_FORMATS: Final[dict[str, tuple[str, str]]] = {
 }
 MAX_IMAGE_PIXELS: Final[int] = 25_000_000
 MAX_ORIGINAL_NAME_BYTES: Final[int] = 500
-MIN_OCR_IMAGE_WIDTH: Final[int] = 1_000
-MIN_OCR_IMAGE_HEIGHT: Final[int] = 1_000
+MIN_OCR_SHORT_SIDE: Final[int] = 600
+MIN_OCR_LONG_SIDE: Final[int] = 800
+QUALITY_SAMPLE_SIZE: Final[tuple[int, int]] = (256, 256)
+DARK_MEAN_THRESHOLD: Final[float] = 40.0
+BRIGHT_MEAN_THRESHOLD: Final[float] = 245.0
+BLUR_EDGE_THRESHOLD: Final[float] = 3.0
 
 
 class UnsupportedImageType(Exception):
@@ -91,10 +95,25 @@ class StoredUpload:
         yield self.size_bytes
 
 
-def _quality_warnings(width: int, height: int) -> tuple[str, ...]:
-    if width < MIN_OCR_IMAGE_WIDTH or height < MIN_OCR_IMAGE_HEIGHT:
-        return ("图片分辨率较低，可能影响文字识别准确率",)
-    return ()
+def _quality_warnings(image: Image.Image) -> tuple[str, ...]:
+    warnings_found: list[str] = []
+    short_side, long_side = sorted(image.size)
+    if short_side < MIN_OCR_SHORT_SIDE or long_side < MIN_OCR_LONG_SIDE:
+        warnings_found.append("图片分辨率可能偏低，建议至少使用 600×800 像素")
+
+    sample = image.convert("L")
+    sample.thumbnail(QUALITY_SAMPLE_SIZE, Image.Resampling.BILINEAR)
+    mean_brightness = ImageStat.Stat(sample).mean[0]
+    if mean_brightness < DARK_MEAN_THRESHOLD:
+        warnings_found.append("图片可能过暗，建议提高光线或亮度")
+    elif mean_brightness > BRIGHT_MEAN_THRESHOLD:
+        warnings_found.append("图片可能过曝，建议避免强光并重新拍摄")
+    else:
+        blurred = sample.filter(ImageFilter.GaussianBlur(radius=2))
+        edge_strength = ImageStat.Stat(ImageChops.difference(sample, blurred)).mean[0]
+        if edge_strength < BLUR_EDGE_THRESHOLD:
+            warnings_found.append("图片可能模糊，建议重新拍摄或扫描")
+    return tuple(warnings_found)
 
 
 def _inspect_supported_image(raw: bytes) -> FileInspection:
@@ -112,6 +131,7 @@ def _inspect_supported_image(raw: bytes) -> FileInspection:
                     raise InvalidImage
                 detected = image.format
                 image.load()
+                quality_warnings = _quality_warnings(image)
     except (
         UnidentifiedImageError,
         Image.DecompressionBombWarning,
@@ -131,7 +151,7 @@ def _inspect_supported_image(raw: bytes) -> FileInspection:
         file_kind="image",
         width=width,
         height=height,
-        warnings=_quality_warnings(width, height),
+        warnings=quality_warnings,
     )
 
 
@@ -144,9 +164,10 @@ def inspect_image(raw: bytes) -> tuple[str, str]:
 
 def _inspect_pdf(raw: bytes) -> FileInspection:
     try:
-        reader = PdfReader(BytesIO(raw))
-        page_count = len(reader.pages)
-    except (PdfReadError, OSError, ValueError, TypeError) as exc:
+        with BytesIO(raw) as stream:
+            reader = PdfReader(stream)
+            page_count = len(reader.pages)
+    except (PyPdfError, OSError, ValueError, TypeError) as exc:
         raise InvalidPdf from exc
     if page_count < 1:
         raise InvalidPdf
