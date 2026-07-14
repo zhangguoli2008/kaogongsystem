@@ -17,6 +17,7 @@ const question = {
   notes: null,
   image_path: null,
   ocr_raw_text: null,
+  ocr_metadata: null,
   knowledge_points: ["增长率计算"],
   error_reason: "计算错" as const,
   mastery_status: "复习中" as const,

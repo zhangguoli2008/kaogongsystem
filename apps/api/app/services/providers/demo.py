@@ -90,12 +90,16 @@ class DemoProvider:
         answers_match = payload.user_answer.strip() == payload.correct_answer.strip()
         has_explanation = bool(payload.original_explanation.strip())
         if answers_match:
-            cause_analysis = "本次作答与正确答案一致，需要通过复盘巩固可复用的判断步骤。"
+            cause_analysis = (
+                "本次作答与正确答案一致，需要通过复盘巩固可复用的判断步骤。"
+            )
         if has_explanation:
             correct_approach = f"{correct_approach} 再对照已有解析核验每一步。"
         else:
-            correct_approach = f"{correct_approach} 题目未提供原解析，完成后自行写出核验过程。"
-        raw_response = {
+            correct_approach = (
+                f"{correct_approach} 题目未提供原解析，完成后自行写出核验过程。"
+            )
+        raw_response: dict[str, object] = {
             "cause_analysis": cause_analysis,
             "knowledge_points": knowledge_points,
             "correct_approach": correct_approach,

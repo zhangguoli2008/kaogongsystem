@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from dataclasses import dataclass
 import hashlib
 from io import BytesIO
 from pathlib import Path
-from typing import Final, Iterator
+from typing import Final, Iterator, Literal
 from uuid import uuid4
 import warnings
 
@@ -13,6 +14,8 @@ from fastapi import UploadFile
 from PIL import Image, ImageChops, ImageFilter, ImageStat, UnidentifiedImageError
 from pypdf import PdfReader
 from pypdf.errors import PyPdfError
+
+from app.core.async_tasks import await_task_outcome
 
 
 ALLOWED_FORMATS: Final[dict[str, tuple[str, str]]] = {
@@ -28,6 +31,7 @@ QUALITY_SAMPLE_SIZE: Final[tuple[int, int]] = (256, 256)
 DARK_MEAN_THRESHOLD: Final[float] = 40.0
 BRIGHT_MEAN_THRESHOLD: Final[float] = 245.0
 BLUR_EDGE_THRESHOLD: Final[float] = 3.0
+FileKind = Literal["image", "pdf"]
 
 
 class UnsupportedImageType(Exception):
@@ -66,7 +70,7 @@ class EmptyFilename(InvalidFilename):
 class FileInspection:
     mime_type: str
     extension: str
-    file_kind: str
+    file_kind: FileKind
     width: int | None = None
     height: int | None = None
     page_count: int | None = None
@@ -79,7 +83,7 @@ class StoredUpload:
     mime_type: str
     original_name: str
     size_bytes: int
-    file_kind: str
+    file_kind: FileKind
     width: int | None
     height: int | None
     page_count: int | None
@@ -210,6 +214,25 @@ def inspect_file(raw: bytes) -> FileInspection:
     return _inspect_file(raw)
 
 
+def _inspect_hash_and_persist(
+    raw: bytes,
+    upload_dir: Path,
+) -> tuple[FileInspection, str, str]:
+    inspection = _inspect_file(raw)
+    sha256 = hashlib.sha256(raw).hexdigest()
+    storage_name = f"{uuid4().hex}{inspection.extension}"
+    target = upload_dir / storage_name
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    if target.parent.resolve() != upload_dir.resolve():
+        raise InvalidImage
+    try:
+        target.write_bytes(raw)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    return inspection, sha256, storage_name
+
+
 async def save_image(
     file: UploadFile,
     *,
@@ -232,18 +255,33 @@ async def save_image(
     if len(base64.b64encode(raw)) > max_upload_bytes:
         raise UploadTooLarge
 
-    inspection = _inspect_file(raw)
-    sha256 = hashlib.sha256(raw).hexdigest()
-    storage_name = f"{uuid4().hex}{inspection.extension}"
-    target = upload_dir / storage_name
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    if target.parent.resolve() != upload_dir.resolve():
-        raise InvalidImage
-    try:
-        target.write_bytes(raw)
-    except Exception:
-        target.unlink(missing_ok=True)
-        raise
+    worker = asyncio.create_task(
+        asyncio.to_thread(
+            _inspect_hash_and_persist,
+            raw,
+            upload_dir,
+        )
+    )
+    outcome = await await_task_outcome(worker)
+    if outcome.error is not None:
+        if outcome.caller_cancelled:
+            raise asyncio.CancelledError from outcome.error
+        raise outcome.error
+    if outcome.value is None:
+        raise RuntimeError("upload worker returned no result")
+    inspection, sha256, storage_name = outcome.value
+
+    if outcome.caller_cancelled:
+        cleanup = asyncio.create_task(
+            asyncio.to_thread(
+                image_path(upload_dir, storage_name).unlink,
+                missing_ok=True,
+            )
+        )
+        cleanup_outcome = await await_task_outcome(cleanup)
+        if cleanup_outcome.error is not None:
+            raise cleanup_outcome.error
+        raise asyncio.CancelledError
 
     return StoredUpload(
         storage_name=storage_name,

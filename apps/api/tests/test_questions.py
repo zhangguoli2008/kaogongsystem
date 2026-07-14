@@ -156,7 +156,10 @@ def test_question_crud_has_defaults_and_updates(client):
 
     deleted = client.delete(f"/api/v1/questions/{question_id}", cookies=cookies)
     assert deleted.status_code == 204
-    assert client.get(f"/api/v1/questions/{question_id}", cookies=cookies).status_code == 404
+    assert (
+        client.get(f"/api/v1/questions/{question_id}", cookies=cookies).status_code
+        == 404
+    )
 
 
 def test_question_persists_strict_ocr_metadata_with_server_derived_urls(client):
@@ -221,7 +224,9 @@ def test_question_persists_strict_ocr_metadata_with_server_derived_urls(client):
     assert "base64" not in serialized.casefold()
 
 
-@pytest.mark.parametrize("reference_kind", ["source", "crop", "figure", "table", "option"])
+@pytest.mark.parametrize(
+    "reference_kind", ["source", "crop", "figure", "table", "option"]
+)
 def test_question_rejects_every_foreign_ocr_asset_reference(client, reference_kind):
     owner = register(client, f"ocr-owner-{reference_kind}@example.com")
     owner_source = upload_question_image(client, owner)
@@ -234,11 +239,21 @@ def test_question_rejects_every_foreign_ocr_asset_reference(client, reference_ki
         metadata["crop"] = {"asset_id": foreign["id"]}
     elif reference_kind == "figure":
         metadata["figures"] = [
-            {"index": 0, "text": None, "coord": None, "asset": {"asset_id": foreign["id"]}}
+            {
+                "index": 0,
+                "text": None,
+                "coord": None,
+                "asset": {"asset_id": foreign["id"]},
+            }
         ]
     elif reference_kind == "table":
         metadata["tables"] = [
-            {"index": 0, "text": None, "coord": None, "asset": {"asset_id": foreign["id"]}}
+            {
+                "index": 0,
+                "text": None,
+                "coord": None,
+                "asset": {"asset_id": foreign["id"]},
+            }
         ]
     else:
         metadata["options"] = [
@@ -298,9 +313,7 @@ def test_question_rejects_oversized_persisted_ocr_text_element(client):
     cookies = register(client, "ocr-text-bound@example.com")
     source = upload_question_image(client, cookies)
     metadata = ocr_metadata(source["id"])
-    metadata["question_elements"] = [
-        {"index": 0, "text": "字" * 20001, "coord": None}
-    ]
+    metadata["question_elements"] = [{"index": 0, "text": "字" * 20001, "coord": None}]
 
     response = client.post(
         "/api/v1/questions",
@@ -390,9 +403,10 @@ def test_question_update_rejects_null_for_required_fields(client, field):
 
     assert response.status_code == 422
     assert response.json()["code"] == "validation_error"
-    assert client.get(
-        f"/api/v1/questions/{created['id']}", cookies=cookies
-    ).json()[field] == created[field]
+    assert (
+        client.get(f"/api/v1/questions/{created['id']}", cookies=cookies).json()[field]
+        == created[field]
+    )
 
 
 def test_question_update_allows_null_for_nullable_fields(client):
@@ -419,11 +433,14 @@ def test_question_is_isolated_by_user(client):
     listed = client.get("/api/v1/questions", cookies=second)
     assert listed.status_code == 200
     assert listed.json()["items"] == []
-    assert client.patch(
-        f"/api/v1/questions/{created['id']}",
-        cookies=second,
-        json={"notes": "不应可见"},
-    ).status_code == 404
+    assert (
+        client.patch(
+            f"/api/v1/questions/{created['id']}",
+            cookies=second,
+            json={"notes": "不应可见"},
+        ).status_code
+        == 404
+    )
 
 
 def test_filters_question_library_and_paginates(client):
@@ -452,9 +469,7 @@ def test_filters_question_library_and_paginates(client):
     assert response.json()["total"] == 1
     assert [item["module"] for item in response.json()["items"]] == ["资料分析"]
 
-    page = client.get(
-        "/api/v1/questions?page=2&page_size=2", cookies=cookies
-    )
+    page = client.get("/api/v1/questions?page=2&page_size=2", cookies=cookies)
     assert page.status_code == 200
     assert page.json()["page"] == 2
     assert page.json()["page_size"] == 2
@@ -515,12 +530,14 @@ def test_bulk_status_and_delete_are_scoped_and_report_missing_ids(client):
         "deleted": 1,
         "not_found": [foreign["id"], "missing"],
     }
-    assert client.get(
-        f"/api/v1/questions/{question_one['id']}", cookies=first
-    ).status_code == 404
-    assert client.get(
-        f"/api/v1/questions/{foreign['id']}", cookies=second
-    ).status_code == 200
+    assert (
+        client.get(f"/api/v1/questions/{question_one['id']}", cookies=first).status_code
+        == 404
+    )
+    assert (
+        client.get(f"/api/v1/questions/{foreign['id']}", cookies=second).status_code
+        == 200
+    )
 
 
 def test_question_requests_require_auth_and_validate_bulk_limit(client):
@@ -540,7 +557,9 @@ def test_manual_analysis_persists_structured_result(client):
     cookies = register(client, "analysis@example.com")
     question = create_question(client, cookies)
 
-    response = client.post(f"/api/v1/questions/{question['id']}/analyze", cookies=cookies)
+    response = client.post(
+        f"/api/v1/questions/{question['id']}/analyze", cookies=cookies
+    )
 
     assert response.status_code == 200
     analysis = response.json()
@@ -575,14 +594,18 @@ def test_analysis_loads_owned_visual_bytes_by_storage_name_and_deduplicates(
             ],
         ),
     )
-    expected = (client.app.state.settings.upload_dir / source["storage_name"]).read_bytes()
+    expected = (
+        client.app.state.settings.upload_dir / source["storage_name"]
+    ).read_bytes()
     seen = {}
 
     class CapturingProvider:
         async def analyze(self, payload, images=(), request_id=None):
             seen["payload"] = payload
             seen["images"] = list(images)
-            return await DemoProvider().analyze(payload, images=images, request_id=request_id)
+            return await DemoProvider().analyze(
+                payload, images=images, request_id=request_id
+            )
 
     monkeypatch.setattr(
         "app.api.routes.questions.get_provider", lambda settings: CapturingProvider()
@@ -625,30 +648,32 @@ def test_analysis_applies_visual_count_and_total_byte_budgets(client, monkeypatc
     class CapturingProvider:
         async def analyze(self, payload, images=(), request_id=None):
             captured_images.append([image.content for image in images])
-            return await DemoProvider().analyze(payload, images=images, request_id=request_id)
+            return await DemoProvider().analyze(
+                payload, images=images, request_id=request_id
+            )
 
     monkeypatch.setattr(
         "app.api.routes.questions.get_provider", lambda settings: CapturingProvider()
     )
-    monkeypatch.setattr("app.api.routes.questions.MAX_ANALYSIS_IMAGES", 2, raising=False)
+    monkeypatch.setattr(
+        "app.api.routes.questions.MAX_ANALYSIS_IMAGES", 2, raising=False
+    )
     monkeypatch.setattr(
         "app.api.routes.questions.MAX_ANALYSIS_IMAGE_TOTAL_BYTES",
         100 * 1024 * 1024,
         raising=False,
     )
-    first = client.post(
-        f"/api/v1/questions/{question['id']}/analyze", cookies=cookies
-    )
+    first = client.post(f"/api/v1/questions/{question['id']}/analyze", cookies=cookies)
 
-    monkeypatch.setattr("app.api.routes.questions.MAX_ANALYSIS_IMAGES", 8, raising=False)
+    monkeypatch.setattr(
+        "app.api.routes.questions.MAX_ANALYSIS_IMAGES", 8, raising=False
+    )
     monkeypatch.setattr(
         "app.api.routes.questions.MAX_ANALYSIS_IMAGE_TOTAL_BYTES",
         crop["size_bytes"],
         raising=False,
     )
-    second = client.post(
-        f"/api/v1/questions/{question['id']}/analyze", cookies=cookies
-    )
+    second = client.post(f"/api/v1/questions/{question['id']}/analyze", cookies=cookies)
 
     assert first.status_code == 200, first.text
     assert second.status_code == 200, second.text
@@ -693,21 +718,19 @@ def test_analysis_revalidates_visual_asset_ownership_in_persisted_metadata(
     monkeypatch.setattr(
         "app.api.routes.questions.get_provider", lambda settings: MustNotRunProvider()
     )
-    response = client.post(
-        f"/api/v1/questions/{question['id']}/analyze", cookies=owner
-    )
+    response = client.post(f"/api/v1/questions/{question['id']}/analyze", cookies=owner)
 
     assert response.status_code == 422
     assert response.json()["code"] == "invalid_ocr_asset_reference"
     assert foreign["id"] not in response.text
 
 
-def test_analysis_rejects_visual_asset_missing_from_controlled_storage(client, monkeypatch):
+def test_analysis_rejects_visual_asset_missing_from_controlled_storage(
+    client, monkeypatch
+):
     cookies = register(client, "analysis-visual-missing@example.com")
     source = upload_question_image(client, cookies)
-    question = create_question(
-        client, cookies, ocr_metadata=ocr_metadata(source["id"])
-    )
+    question = create_question(client, cookies, ocr_metadata=ocr_metadata(source["id"]))
     (client.app.state.settings.upload_dir / source["storage_name"]).unlink()
 
     class MustNotRunProvider:
@@ -730,9 +753,7 @@ def test_analysis_redecodes_stored_image_and_rejects_corrupted_content(
 ):
     cookies = register(client, "analysis-visual-corrupt@example.com")
     source = upload_question_image(client, cookies)
-    question = create_question(
-        client, cookies, ocr_metadata=ocr_metadata(source["id"])
-    )
+    question = create_question(client, cookies, ocr_metadata=ocr_metadata(source["id"]))
     (client.app.state.settings.upload_dir / source["storage_name"]).write_bytes(
         b"not-an-image"
     )
@@ -755,15 +776,15 @@ def test_analysis_redecodes_stored_image_and_rejects_corrupted_content(
 def test_analysis_converts_verified_bmp_to_bounded_png_input(client, monkeypatch):
     cookies = register(client, "analysis-visual-bmp@example.com")
     source = upload_question_image(client, cookies, color="orange", image_format="BMP")
-    question = create_question(
-        client, cookies, ocr_metadata=ocr_metadata(source["id"])
-    )
+    question = create_question(client, cookies, ocr_metadata=ocr_metadata(source["id"]))
     seen = {}
 
     class CapturingProvider:
         async def analyze(self, payload, images=(), request_id=None):
             seen["images"] = list(images)
-            return await DemoProvider().analyze(payload, images=images, request_id=request_id)
+            return await DemoProvider().analyze(
+                payload, images=images, request_id=request_id
+            )
 
     monkeypatch.setattr(
         "app.api.routes.questions.get_provider", lambda settings: CapturingProvider()
@@ -783,12 +804,8 @@ def test_reanalysis_keeps_history_and_updates_current_analysis(client):
     cookies = register(client, "reanalysis@example.com")
     question = create_question(client, cookies)
 
-    first = client.post(
-        f"/api/v1/questions/{question['id']}/analyze", cookies=cookies
-    )
-    second = client.post(
-        f"/api/v1/questions/{question['id']}/analyze", cookies=cookies
-    )
+    first = client.post(f"/api/v1/questions/{question['id']}/analyze", cookies=cookies)
+    second = client.post(f"/api/v1/questions/{question['id']}/analyze", cookies=cookies)
     detail = client.get(f"/api/v1/questions/{question['id']}", cookies=cookies)
 
     assert first.status_code == 200
@@ -814,9 +831,7 @@ def test_question_analysis_is_isolated_by_user(client):
     question = create_question(client, owner)
     other = register(client, "analysis-other@example.com")
 
-    response = client.post(
-        f"/api/v1/questions/{question['id']}/analyze", cookies=other
-    )
+    response = client.post(f"/api/v1/questions/{question['id']}/analyze", cookies=other)
 
     assert response.status_code == 404
     assert response.json()["code"] == "not_found"
@@ -836,7 +851,9 @@ def test_analysis_failure_marks_question_failed_without_provider_detail(
     monkeypatch.setattr(
         "app.api.routes.questions.get_provider", lambda settings: FailingProvider()
     )
-    response = client.post(f"/api/v1/questions/{question['id']}/analyze", cookies=cookies)
+    response = client.post(
+        f"/api/v1/questions/{question['id']}/analyze", cookies=cookies
+    )
     detail = client.get(f"/api/v1/questions/{question['id']}", cookies=cookies)
 
     assert response.status_code == 502
@@ -859,13 +876,14 @@ def test_successful_reanalysis_clears_prior_failure_code(client, monkeypatch):
     monkeypatch.setattr(
         "app.api.routes.questions.get_provider", lambda settings: FailingProvider()
     )
-    failed = client.post(
-        f"/api/v1/questions/{question['id']}/analyze", cookies=cookies
-    )
+    failed = client.post(f"/api/v1/questions/{question['id']}/analyze", cookies=cookies)
     assert failed.status_code == 504
-    assert client.get(f"/api/v1/questions/{question['id']}", cookies=cookies).json()[
-        "analysis_error_code"
-    ] == "provider_timeout"
+    assert (
+        client.get(f"/api/v1/questions/{question['id']}", cookies=cookies).json()[
+            "analysis_error_code"
+        ]
+        == "provider_timeout"
+    )
 
     monkeypatch.setattr(
         "app.api.routes.questions.get_provider", lambda settings: DemoProvider()
@@ -892,9 +910,12 @@ def test_invalid_analysis_result_marks_question_failed_and_returns_stable_code(
             return object()
 
     monkeypatch.setattr(
-        "app.api.routes.questions.get_provider", lambda settings: InvalidResultProvider()
+        "app.api.routes.questions.get_provider",
+        lambda settings: InvalidResultProvider(),
     )
-    response = client.post(f"/api/v1/questions/{question['id']}/analyze", cookies=cookies)
+    response = client.post(
+        f"/api/v1/questions/{question['id']}/analyze", cookies=cookies
+    )
     detail = client.get(f"/api/v1/questions/{question['id']}", cookies=cookies)
 
     assert response.status_code == 502
@@ -925,9 +946,12 @@ def test_mutated_analysis_result_is_revalidated_before_persistence(client, monke
             return result
 
     monkeypatch.setattr(
-        "app.api.routes.questions.get_provider", lambda settings: MutatedResultProvider()
+        "app.api.routes.questions.get_provider",
+        lambda settings: MutatedResultProvider(),
     )
-    response = client.post(f"/api/v1/questions/{question['id']}/analyze", cookies=cookies)
+    response = client.post(
+        f"/api/v1/questions/{question['id']}/analyze", cookies=cookies
+    )
     detail = client.get(f"/api/v1/questions/{question['id']}", cookies=cookies)
 
     assert response.status_code == 502
@@ -951,11 +975,7 @@ def test_analysis_uses_per_user_provider_rate_limit(client):
 
 
 def test_bulk_routes_are_registered_before_id_route(client):
-    paths = [
-        route.path
-        for route in questions_router.routes
-        if hasattr(route, "path")
-    ]
+    paths = [route.path for route in questions_router.routes if hasattr(route, "path")]
 
     assert paths.index("/questions/bulk-status") < paths.index(
         "/questions/{question_id}"

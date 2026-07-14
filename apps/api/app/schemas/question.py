@@ -166,7 +166,7 @@ class QuestionUpdate(BaseModel):
         mode="before",
     )
     @classmethod
-    def reject_null_for_required_fields(cls, value):
+    def reject_null_for_required_fields(cls, value: object) -> object:
         if value is None:
             raise ValueError("Field cannot be null")
         return value

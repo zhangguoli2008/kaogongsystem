@@ -4,13 +4,14 @@ import asyncio
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from PIL import Image
 from pydantic import ValidationError
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.selectable import Exists
 
 from app.api.deps import CurrentUser
 from app.core.database import get_session
@@ -26,6 +27,7 @@ from app.schemas.question import (
     ErrorReason,
     ExamModule,
     MasteryStatus,
+    QuestionOption,
     QuestionCreate,
     AnalysisRead,
     QuestionOcrAsset,
@@ -78,9 +80,12 @@ def _ocr_asset_references(
     references: list[tuple[QuestionOcrAsset, bool]] = [(metadata.source, False)]
     if metadata.crop is not None:
         references.append((metadata.crop, True))
-    for item in (*metadata.figures, *metadata.tables, *metadata.options):
+    for item in (*metadata.figures, *metadata.tables):
         if item.asset is not None:
             references.append((item.asset, True))
+    for option in metadata.options:
+        if option.asset is not None:
+            references.append((option.asset, True))
     return references
 
 
@@ -90,9 +95,12 @@ def _analysis_asset_references(
     references: list[QuestionOcrAsset] = []
     if metadata.crop is not None:
         references.append(metadata.crop)
-    for item in (*metadata.figures, *metadata.tables, *metadata.options):
+    for item in (*metadata.figures, *metadata.tables):
         if item.asset is not None:
             references.append(item.asset)
+    for option in metadata.options:
+        if option.asset is not None:
+            references.append(option.asset)
     references.append(metadata.source)
     return references
 
@@ -101,12 +109,16 @@ def _verified_provider_image(
     content: bytes,
     *,
     expected_mime_type: str,
-) -> tuple[str, bytes]:
+) -> tuple[Literal["image/jpeg", "image/png"], bytes]:
     detected_mime_type, _ = inspect_image(content)
     if detected_mime_type != expected_mime_type:
         raise InvalidImage
+    if detected_mime_type == "image/jpeg":
+        return "image/jpeg", content
+    if detected_mime_type == "image/png":
+        return "image/png", content
     if detected_mime_type != "image/bmp":
-        return detected_mime_type, content
+        raise InvalidImage
 
     with Image.open(BytesIO(content)) as image:
         image.load()
@@ -116,7 +128,7 @@ def _verified_provider_image(
     converted_mime_type, _ = inspect_image(converted)
     if converted_mime_type != "image/png":
         raise InvalidImage
-    return converted_mime_type, converted
+    return "image/png", converted
 
 
 async def _validate_ocr_metadata_assets(
@@ -245,12 +257,12 @@ async def _load_analysis_images(
     return images
 
 
-def _knowledge_point_filter(knowledge_point: str, session: AsyncSession):
+def _knowledge_point_filter(knowledge_point: str, session: AsyncSession) -> Exists:
     """Return an EXISTS predicate that works with SQLite and PostgreSQL JSON arrays."""
     if session.get_bind().dialect.name == "postgresql":
-        points = func.json_array_elements_text(
-            Question.knowledge_points
-        ).table_valued("value")
+        points = func.json_array_elements_text(Question.knowledge_points).table_valued(
+            "value"
+        )
     else:
         points = func.json_each(Question.knowledge_points).table_valued("value")
     return (
@@ -326,7 +338,10 @@ async def list_questions(
         .limit(page_size)
     )
     return QuestionPage(
-        items=list(result), page=page, page_size=page_size, total=count or 0
+        items=[QuestionRead.model_validate(question) for question in result],
+        page=page,
+        page_size=page_size,
+        total=count or 0,
     )
 
 
@@ -473,7 +488,9 @@ async def analyze_question(
     try:
         payload = AnalysisInput(
             stem=question.stem,
-            options=question.options,
+            options=[
+                QuestionOption.model_validate(option) for option in question.options
+            ],
             user_answer=question.user_answer,
             correct_answer=question.correct_answer,
             original_explanation=question.original_explanation or "",
@@ -503,7 +520,9 @@ async def analyze_question(
             )
         except (TypeError, ValueError) as exc:
             raise APIError(
-                502, "provider_invalid_response", _ANALYSIS_ERROR_MESSAGES["provider_invalid_response"]
+                502,
+                "provider_invalid_response",
+                _ANALYSIS_ERROR_MESSAGES["provider_invalid_response"],
             ) from exc
 
         analysis = Analysis(
@@ -538,6 +557,4 @@ async def analyze_question(
             user_id=current_user.id,
             code=code,
         )
-        raise APIError(
-            502, code, _ANALYSIS_ERROR_MESSAGES[code]
-        ) from exc
+        raise APIError(502, code, _ANALYSIS_ERROR_MESSAGES[code]) from exc

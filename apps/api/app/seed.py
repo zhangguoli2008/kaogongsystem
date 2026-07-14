@@ -274,7 +274,11 @@ async def seed_demo_data(session: AsyncSession) -> dict[str, int]:
                 )
 
     await session.commit()
-    return {"questions": len(DEMO_QUESTIONS), "analyses": len(DEMO_QUESTIONS), "reviews": 6}
+    return {
+        "questions": len(DEMO_QUESTIONS),
+        "analyses": len(DEMO_QUESTIONS),
+        "reviews": 6,
+    }
 
 
 async def _main() -> None:

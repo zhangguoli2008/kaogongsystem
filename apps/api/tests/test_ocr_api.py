@@ -368,9 +368,9 @@ def test_demo_ocr_returns_editable_multi_question_draft_without_saving(client) -
     }
     assert payload["provider"] == "mock"
     assert payload["api_name"] == "QuestionSplitOCR"
-    assert payload["request_id"] == "mock-question-split-v1"
-    assert payload["question_count"] == 2
-    assert len(payload["questions"]) == 2
+    assert payload["request_id"] == "mock-question-split-page-1"
+    assert payload["question_count"] == 4
+    assert len(payload["questions"]) == 4
     assert payload["source"]["file_id"] == uploaded["id"]
     assert payload["is_demo"] is True
     rendered = response.text
@@ -567,7 +567,9 @@ def test_ocr_response_and_structured_log_do_not_leak_sensitive_payloads(
 
     assert response.status_code == 200, response.text
     records = [
-        record for record in caplog.records if record.getMessage() == "OCR request completed"
+        record
+        for record in caplog.records
+        if record.getMessage() == "OCR request completed"
     ]
     assert len(records) == 1
     record = records[0]
@@ -670,7 +672,7 @@ def test_status_has_explicit_schema_and_never_calls_service_or_sdk(
     assert "fake-configured-id" not in response.text
     assert "fake-configured-key" not in response.text
 
-    schema = client.app.openapi()["paths"]["/api/v1/ocr/status"]["get"][
-        "responses"
-    ]["200"]["content"]["application/json"]["schema"]
+    schema = client.app.openapi()["paths"]["/api/v1/ocr/status"]["get"]["responses"][
+        "200"
+    ]["content"]["application/json"]["schema"]
     assert schema["$ref"].endswith("/OcrStatus")

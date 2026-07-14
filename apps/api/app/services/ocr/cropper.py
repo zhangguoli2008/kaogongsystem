@@ -10,7 +10,7 @@ from typing import Literal
 
 from PIL import Image
 
-from app.schemas.ocr import OcrPolygon, OcrQuestion, OcrResult
+from app.schemas.ocr import OcrMedia, OcrPolygon, OcrQuestion, OcrResult
 from app.services.ocr.types import Response
 from app.services.storage import (
     MAX_IMAGE_PIXELS,
@@ -154,9 +154,7 @@ def _artifact(
         question_position=question_position,
         item_position=item_position,
         png_bytes=png,
-        original_name=(
-            f"ocr-question-{question_position + 1}-{kind}{item_suffix}.png"
-        ),
+        original_name=(f"ocr-question-{question_position + 1}-{kind}{item_suffix}.png"),
     )
 
 
@@ -182,22 +180,24 @@ def build_crop_batch(
     total_corrected_pixels = 0
     total_png_bytes = 0
     png_bytes_exhausted = False
+    attempted_artifacts = 0
 
     def warn_once(message: str) -> None:
         if message not in global_warnings:
             global_warnings.append(message)
 
     def can_generate_artifact() -> bool:
-        nonlocal png_bytes_exhausted
+        nonlocal attempted_artifacts, png_bytes_exhausted
         if png_bytes_exhausted:
             return False
         if max_total_png_bytes < 1:
             warn_once("已达到裁剪图片总大小上限，后续裁剪已跳过")
             png_bytes_exhausted = True
             return False
-        if len(artifacts) >= max(0, max_artifacts):
+        if attempted_artifacts >= max(0, max_artifacts):
             warn_once("已达到裁剪图片数量上限，后续裁剪已跳过")
             return False
+        attempted_artifacts += 1
         return True
 
     def collect_artifact(artifact: CropArtifact | None) -> None:
@@ -221,9 +221,8 @@ def build_crop_batch(
             if encoded_length > _max_base64_length(max_corrected_image_bytes):
                 warn_once("OCR 矫正图超过大小上限，已忽略该图")
                 continue
-            if (
-                total_corrected_base64_bytes + encoded_length
-                > _max_base64_length(max_corrected_images_total_bytes)
+            if total_corrected_base64_bytes + encoded_length > _max_base64_length(
+                max_corrected_images_total_bytes
             ):
                 warn_once("OCR 矫正图超过响应累计大小上限，已忽略后续图")
                 continue
@@ -275,10 +274,11 @@ def build_crop_batch(
                     )
                 )
 
-            for kind, items in (
+            media_groups: tuple[tuple[CropKind, list[OcrMedia]], ...] = (
                 ("figure", question.figures),
                 ("table", question.tables),
-            ):
+            )
+            for kind, items in media_groups:
                 for item_position, item in enumerate(items):
                     if can_generate_artifact():
                         collect_artifact(
@@ -302,9 +302,7 @@ def build_crop_batch(
                             _artifact(
                                 image=image,
                                 polygons=(
-                                    [option.coord]
-                                    if option.coord is not None
-                                    else []
+                                    [option.coord] if option.coord is not None else []
                                 ),
                                 kind="option",
                                 question_position=question_position,

@@ -188,9 +188,7 @@ def test_normalizes_official_single_question_shape_without_semantic_rewrites() -
     assert question.source_info_index == 0
     assert question.question_number == "1"
     assert question.question_type == "multiple_choice_unknown"
-    assert question.question_text == (
-        "1. 2024年，3∶2 的值是？\n第二行含公式 x²+y²=1"
-    )
+    assert question.question_text == ("1. 2024年，3∶2 的值是？\n第二行含公式 x²+y²=1")
     assert question.full_text == (
         "1. 2024年，3∶2 的值是？\n第二行含公式 x²+y²=1\nA、5\nB．6"
     )
@@ -253,7 +251,11 @@ def test_flattens_multiple_question_infos_in_local_order() -> None:
 
     assert [question.index for question in actual.questions] == [0, 1, 2]
     assert [question.source_info_index for question in actual.questions] == [0, 0, 1]
-    assert [question.question_number for question in actual.questions] == ["5", "3", "6"]
+    assert [question.question_number for question in actual.questions] == [
+        "5",
+        "3",
+        "6",
+    ]
     assert len({question.temporary_id for question in actual.questions}) == 3
     assert actual.question_count == 3
     assert actual.source.original_width == 1200
@@ -283,11 +285,7 @@ def test_normalizes_only_supported_question_number_shapes(
     raw_number: str, expected: str | None
 ) -> None:
     actual = normalize(
-        response(
-            question_info(
-                [result_list(Question=[element(f"{raw_number} 题干")])]
-            )
-        )
+        response(question_info([result_list(Question=[element(f"{raw_number} 题干")])]))
     )
 
     assert actual.questions[0].question_number == expected
@@ -310,11 +308,7 @@ def test_maps_only_explicit_tencent_question_types(
     actual = normalize(
         response(
             question_info(
-                [
-                    result_list(
-                        Question=[element("1. 题干", group_type=raw_type)]
-                    )
-                ]
+                [result_list(Question=[element("1. 题干", group_type=raw_type)])]
             )
         )
     )
@@ -449,7 +443,9 @@ def test_empty_answer_and_parse_text_normalize_to_null() -> None:
     assert question.recognized_parse is None
 
 
-def test_full_text_keeps_question_options_and_table_but_excludes_answer_and_figure() -> None:
+def test_full_text_keeps_question_options_and_table_but_excludes_answer_and_figure() -> (
+    None
+):
     raw_result = result_list(
         Question=[element("1. 题干", group_type="multiple-choice")],
         Option=[element("B.乙", index=2), element("A.甲", index=1)],

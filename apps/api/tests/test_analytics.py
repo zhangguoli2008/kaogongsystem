@@ -94,7 +94,7 @@ def test_trend_for_days_compiles_a_utc_date_bucket_for_postgresql():
 def test_analytics_aggregates_only_current_user_and_fills_trends(client):
     owner = register(client, "analytics-owner@example.com")
     now = datetime.now(timezone.utc)
-    today = create_question(
+    create_question(
         client,
         owner,
         module="资料分析",
@@ -146,7 +146,9 @@ def test_analytics_aggregates_only_current_user_and_fills_trends(client):
     assert "增长率" in summary["ai_summary"]
 
 
-def test_dashboard_uses_current_user_data_and_never_calls_a_provider(client, monkeypatch):
+def test_dashboard_uses_current_user_data_and_never_calls_a_provider(
+    client, monkeypatch
+):
     owner = register(client, "dashboard-owner@example.com")
     first = create_question(client, owner, module="数量关系")
     second = create_question(client, owner, module="资料分析")

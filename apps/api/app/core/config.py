@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
@@ -61,22 +62,67 @@ class Settings(BaseSettings):
     tencentcloud_secret_id: str | None = None
     tencentcloud_secret_key: str | None = None
     tencentcloud_region: str = ""
-    tencentcloud_ocr_timeout_seconds: int = 30
-    tencentcloud_ocr_max_concurrency: int = 2
-    tencentcloud_ocr_queue_timeout_seconds: int = 5
-    tencentcloud_ocr_max_retries: int = 2
-    ocr_rate_limit_per_minute: int = 5
-    ocr_rate_limit_per_hour: int = 50
-    ocr_corrected_image_max_bytes: int = 10 * 1024 * 1024
-    ocr_corrected_images_max_total_bytes: int = 10 * 1024 * 1024
-    ocr_crop_max_artifacts: int = 100
-    ocr_crop_max_total_png_bytes: int = 10 * 1024 * 1024
+    tencentcloud_ocr_timeout_seconds: int = Field(default=30, ge=1, le=60)
+    tencentcloud_ocr_max_concurrency: int = Field(default=2, ge=1, le=10)
+    tencentcloud_ocr_queue_timeout_seconds: int = Field(default=5, ge=1, le=60)
+    tencentcloud_ocr_max_retries: int = Field(default=2, ge=0, le=2)
+    ocr_processing_lease_seconds: int = Field(default=180, ge=60, le=3600)
+    ocr_rate_limit_per_minute: int = Field(default=5, ge=1, le=60)
+    ocr_rate_limit_per_hour: int = Field(default=50, ge=1, le=1000)
+    ocr_corrected_image_max_bytes: int = Field(
+        default=10 * 1024 * 1024,
+        ge=1,
+        le=10 * 1024 * 1024,
+    )
+    ocr_corrected_images_max_total_bytes: int = Field(
+        default=10 * 1024 * 1024,
+        ge=1,
+        le=10 * 1024 * 1024,
+    )
+    ocr_crop_max_artifacts: int = Field(default=100, ge=1, le=100)
+    ocr_crop_max_total_png_bytes: int = Field(
+        default=10 * 1024 * 1024,
+        ge=1,
+        le=10 * 1024 * 1024,
+    )
     upload_dir: Path = Path("/data/uploads")
-    max_upload_bytes: int = 10 * 1024 * 1024
+    max_upload_bytes: int = Field(
+        default=10 * 1024 * 1024,
+        ge=1024 * 1024,
+        le=10 * 1024 * 1024,
+    )
+    upload_max_concurrency: int = Field(default=2, ge=1, le=10)
+    upload_queue_timeout_seconds: float = Field(default=5.0, ge=0.1, le=60.0)
+    upload_rate_limit_per_minute: int = Field(default=10, ge=1, le=60)
+    upload_rate_limit_per_hour: int = Field(default=100, ge=1, le=1000)
     allowed_origins: list[str] = ["http://localhost:3000"]
     allowed_hosts: list[str] = ["*"]
     cookie_secure: bool = False
     model_config = SettingsConfigDict(env_file="../../.env", extra="ignore")
+
+    @model_validator(mode="after")
+    def validate_resource_limits(self) -> "Settings":
+        if self.ocr_rate_limit_per_minute > self.ocr_rate_limit_per_hour:
+            raise ValueError(
+                "OCR_RATE_LIMIT_PER_MINUTE cannot exceed OCR_RATE_LIMIT_PER_HOUR"
+            )
+        minimum_processing_lease = (
+            self.tencentcloud_ocr_queue_timeout_seconds
+            + self.tencentcloud_ocr_timeout_seconds
+            * (self.tencentcloud_ocr_max_retries + 1)
+            + 30
+        )
+        if self.ocr_processing_lease_seconds < minimum_processing_lease:
+            raise ValueError(
+                "OCR_PROCESSING_LEASE_SECONDS must be at least "
+                f"{minimum_processing_lease} for the configured OCR timeouts "
+                "and retries"
+            )
+        if self.upload_rate_limit_per_minute > self.upload_rate_limit_per_hour:
+            raise ValueError(
+                "UPLOAD_RATE_LIMIT_PER_MINUTE cannot exceed UPLOAD_RATE_LIMIT_PER_HOUR"
+            )
+        return self
 
     @property
     def effective_provider_mode(self) -> Literal["live", "demo"]:
@@ -92,7 +138,10 @@ class Settings(BaseSettings):
             return
 
         errors: list[str] = []
-        if len(self.jwt_secret.encode("utf-8")) < 32 or self.jwt_secret == DEFAULT_JWT_SECRET:
+        if (
+            len(self.jwt_secret.encode("utf-8")) < 32
+            or self.jwt_secret == DEFAULT_JWT_SECRET
+        ):
             errors.append("JWT_SECRET must be a non-default value of at least 32 bytes")
         if self.internal_proxy_secret is None or not re.fullmatch(
             r"[0-9a-f]{64}", self.internal_proxy_secret
@@ -131,7 +180,9 @@ class Settings(BaseSettings):
             or "healthcheck.railway.app" not in self.allowed_hosts
             or "api.railway.internal" not in self.allowed_hosts
         ):
-            errors.append("ALLOWED_HOSTS must include API private and healthcheck hosts")
+            errors.append(
+                "ALLOWED_HOSTS must include API private and healthcheck hosts"
+            )
         if self.upload_dir != Path("/data/uploads"):
             errors.append("UPLOAD_DIR must be /data/uploads")
 

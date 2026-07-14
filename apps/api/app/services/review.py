@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta, timezone
+from typing import cast
 
 from sqlalchemy import func, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.selectable import TableValuedAlias
 
 from app.models.question import Question
 from app.models.review import ReviewRecord, UserSettings
-from app.schemas.question import MasteryStatus
-from app.schemas.review import TodayReviewResponse
+from app.schemas.question import MasteryStatus, QuestionRead
+from app.schemas.review import (
+    DailyReviewLimit,
+    ReviewRecordRead,
+    TodayReviewResponse,
+)
 
 
 ALLOWED_DAILY_REVIEW_LIMITS = frozenset({10, 20, 30, 50})
@@ -30,7 +36,7 @@ def _day_bounds(now: datetime) -> tuple[datetime, datetime]:
     return start, start + timedelta(days=1)
 
 
-def _knowledge_point_rows(session: AsyncSession):
+def _knowledge_point_rows(session: AsyncSession) -> TableValuedAlias:
     if session.get_bind().dialect.name == "postgresql":
         return func.json_array_elements_text(Question.knowledge_points).table_valued(
             "value"
@@ -83,7 +89,9 @@ def score_review_candidate(
     return score
 
 
-async def get_daily_review_limit(session: AsyncSession, user_id: str) -> int:
+async def get_daily_review_limit(
+    session: AsyncSession, user_id: str
+) -> DailyReviewLimit:
     limit = await session.scalar(
         select(UserSettings.daily_review_limit).where(UserSettings.user_id == user_id)
     )
@@ -93,7 +101,7 @@ async def get_daily_review_limit(session: AsyncSession, user_id: str) -> int:
         return 20
     if limit not in ALLOWED_DAILY_REVIEW_LIMITS:
         raise ValueError("daily_review_limit must be one of 10, 20, 30, 50")
-    return limit
+    return cast(DailyReviewLimit, limit)
 
 
 async def get_today_review(
@@ -132,9 +140,7 @@ async def get_today_review(
         )
     )
     pending = [
-        question
-        for question in candidates
-        if question.id not in completed_question_ids
+        question for question in candidates if question.id not in completed_question_ids
     ]
     pending.sort(
         key=lambda question: (
@@ -151,8 +157,8 @@ async def get_today_review(
     pending = pending[:remaining_capacity]
     return TodayReviewResponse(
         daily_review_limit=daily_limit,
-        pending=pending,
-        completed=completed,
+        pending=[QuestionRead.model_validate(question) for question in pending],
+        completed=[ReviewRecordRead.model_validate(record) for record in completed],
         completed_count=len(completed_question_ids),
         total=len(pending) + len(completed_question_ids),
     )

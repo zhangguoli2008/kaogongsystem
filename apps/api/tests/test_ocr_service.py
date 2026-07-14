@@ -1,5 +1,6 @@
 import asyncio
 import base64
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from io import BytesIO
@@ -10,7 +11,8 @@ from PIL import Image
 import pytest
 from pypdf import PdfWriter
 from sqlalchemy.dialects import postgresql, sqlite
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.config import Settings
@@ -92,11 +94,7 @@ class FakeProvider:
                             "OrgWidth": 100,
                             "OrgHeight": 100,
                             "ResultList": [
-                                {
-                                    "Question": [
-                                        {"Index": 0, "Text": "1. 测试题"}
-                                    ]
-                                }
+                                {"Question": [{"Index": 0, "Text": "1. 测试题"}]}
                             ],
                         }
                     ],
@@ -171,6 +169,29 @@ class CroppingProvider(FakeProvider):
         )
 
 
+class GatedCroppingProvider(CroppingProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def recognize_questions(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        content_type: str,
+        pdf_page_number: int = 1,
+    ) -> Response:
+        self.started.set()
+        await self.release.wait()
+        return await super().recognize_questions(
+            file_bytes,
+            filename,
+            content_type,
+            pdf_page_number,
+        )
+
+
 class FailingProvider(FakeProvider):
     async def recognize_questions(
         self,
@@ -186,6 +207,29 @@ class FailingProvider(FakeProvider):
             code="OCR_PROVIDER_ERROR",
             message="OCR 服务暂时不可用",
             retryable=False,
+        )
+
+
+class GatedFailingProvider(FailingProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def recognize_questions(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        content_type: str,
+        pdf_page_number: int = 1,
+    ) -> Response:
+        self.started.set()
+        await self.release.wait()
+        return await super().recognize_questions(
+            file_bytes,
+            filename,
+            content_type,
+            pdf_page_number,
         )
 
 
@@ -289,6 +333,10 @@ class RequestIdFailingProvider(FakeProvider):
 
 
 class NoQuestionProvider(FakeProvider):
+    def __init__(self, request_id: str = "no-question-request") -> None:
+        super().__init__()
+        self.request_id = request_id
+
     async def recognize_questions(
         self,
         file_bytes: bytes,
@@ -301,7 +349,7 @@ class NoQuestionProvider(FakeProvider):
         return Response.model_validate(
             {
                 "QuestionInfo": [{"ResultList": []}],
-                "RequestId": "no-question-request",
+                "RequestId": self.request_id,
             }
         )
 
@@ -367,9 +415,7 @@ class MultiCorrectedProvider(FakeProvider):
                     "ImageBase64": self.encoded,
                     "ResultList": [
                         {
-                            "Question": [
-                                {"Index": 0, "Text": f"{number}. 累计图测试"}
-                            ],
+                            "Question": [{"Index": 0, "Text": f"{number}. 累计图测试"}],
                             "Coord": [_polygon(0, 0, 20, 20)],
                         }
                     ],
@@ -377,6 +423,47 @@ class MultiCorrectedProvider(FakeProvider):
             )
         return Response.model_validate(
             {"QuestionInfo": infos, "RequestId": "multi-corrected"}
+        )
+
+
+class MissingCoordMediaProvider(FakeProvider):
+    async def recognize_questions(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        content_type: str,
+        pdf_page_number: int = 1,
+    ) -> Response:
+        del file_bytes, filename, content_type, pdf_page_number
+        self.calls += 1
+        return Response.model_validate(
+            {
+                "QuestionInfo": [
+                    {
+                        "Width": 100,
+                        "Height": 100,
+                        "OrgWidth": 100,
+                        "OrgHeight": 100,
+                        "ResultList": [
+                            {
+                                "Question": [
+                                    {
+                                        "Index": 0,
+                                        "Text": "1. 大量无坐标图形",
+                                        "Coord": _polygon(0, 0, 20, 20),
+                                    }
+                                ],
+                                "Figure": [
+                                    {"Index": index, "Text": f"图形 {index}"}
+                                    for index in range(25)
+                                ],
+                                "Coord": [_polygon(0, 0, 20, 20)],
+                            }
+                        ],
+                    }
+                ],
+                "RequestId": "missing-coord-media",
+            }
         )
 
 
@@ -540,7 +627,7 @@ def test_global_semaphore_caps_provider_calls_and_queue_timeout_is_safe(tmp_path
                 )
             )
             for index, (session, (user_id, asset)) in enumerate(
-                zip(sessions[:2], sources[:2])
+                zip(sessions[:2], sources[:2], strict=True)
             )
         ]
         try:
@@ -571,6 +658,195 @@ def test_global_semaphore_caps_provider_calls_and_queue_timeout_is_safe(tmp_path
             await asyncio.gather(*tasks[:2])
             for session in sessions:
                 await session.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_global_semaphore_covers_normalize_crop_persist_and_terminal_cas(
+    tmp_path, monkeypatch
+):
+    first_crop_started = threading.Event()
+    second_crop_started = threading.Event()
+    release_first_crop = threading.Event()
+    call_guard = threading.Lock()
+    crop_calls = 0
+    real_build_crop_batch = ocr_service_module.build_crop_batch
+
+    def blocking_build_crop_batch(*args, **kwargs):
+        nonlocal crop_calls
+        with call_guard:
+            crop_calls += 1
+            position = crop_calls
+        if position == 1:
+            first_crop_started.set()
+            assert release_first_crop.wait(timeout=3)
+        else:
+            second_crop_started.set()
+        return real_build_crop_batch(*args, **kwargs)
+
+    monkeypatch.setattr(
+        ocr_service_module,
+        "build_crop_batch",
+        blocking_build_crop_batch,
+    )
+
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        settings = settings.model_copy(update={"tencentcloud_ocr_max_concurrency": 1})
+        first_session = factory()
+        second_session = factory()
+        first_request = None
+        second_request = None
+        try:
+            user_id, first_source = await _source_asset(factory, settings)
+            second_source = await _additional_asset(
+                factory,
+                settings,
+                user_id=user_id,
+                color="green",
+            )
+            provider = FakeProvider()
+            service = OCRService(provider, settings)
+            first_request = asyncio.create_task(
+                service.recognize(
+                    first_session,
+                    user_id=user_id,
+                    asset=first_source,
+                    pdf_page_number=1,
+                    local_request_id="crop-concurrency-first",
+                )
+            )
+            assert await asyncio.to_thread(first_crop_started.wait, 2)
+
+            second_request = asyncio.create_task(
+                service.recognize(
+                    second_session,
+                    user_id=user_id,
+                    asset=second_source,
+                    pdf_page_number=1,
+                    local_request_id="crop-concurrency-second",
+                )
+            )
+            assert not await asyncio.to_thread(second_crop_started.wait, 0.5)
+            assert provider.calls == 1
+
+            release_first_crop.set()
+            first, second = await asyncio.gather(first_request, second_request)
+            assert first.question_count == second.question_count == 1
+            assert crop_calls == 2
+        finally:
+            release_first_crop.set()
+            pending = [
+                request
+                for request in (first_request, second_request)
+                if request is not None and not request.done()
+            ]
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            await first_session.close()
+            await second_session.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_cancellation_during_crop_compute_holds_semaphore_until_worker_stops(
+    tmp_path, monkeypatch
+):
+    first_crop_started = threading.Event()
+    release_first_crop = threading.Event()
+    second_crop_started = threading.Event()
+    real_build_crop_batch = ocr_service_module.build_crop_batch
+    call_lock = threading.Lock()
+    calls = 0
+
+    def controlled_build_crop_batch(*args, **kwargs):
+        nonlocal calls
+        with call_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            first_crop_started.set()
+            assert release_first_crop.wait(timeout=5)
+        else:
+            second_crop_started.set()
+        return real_build_crop_batch(*args, **kwargs)
+
+    monkeypatch.setattr(
+        ocr_service_module,
+        "build_crop_batch",
+        controlled_build_crop_batch,
+    )
+
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        settings = settings.model_copy(update={"tencentcloud_ocr_max_concurrency": 1})
+        first_session = factory()
+        second_session = factory()
+        first_request = None
+        second_request = None
+        try:
+            user_id, first_source = await _source_asset(factory, settings)
+            second_source = await _additional_asset(
+                factory,
+                settings,
+                user_id=user_id,
+                color="green",
+            )
+            provider = FakeProvider()
+            service = OCRService(provider, settings)
+            first_request = asyncio.create_task(
+                service.recognize(
+                    first_session,
+                    user_id=user_id,
+                    asset=first_source,
+                    pdf_page_number=1,
+                    local_request_id="cancel-crop-compute-first",
+                )
+            )
+            assert await asyncio.to_thread(first_crop_started.wait, 2)
+            first_request.cancel()
+            await asyncio.sleep(0)
+
+            second_request = asyncio.create_task(
+                service.recognize(
+                    second_session,
+                    user_id=user_id,
+                    asset=second_source,
+                    pdf_page_number=1,
+                    local_request_id="cancel-crop-compute-second",
+                )
+            )
+            assert not await asyncio.to_thread(second_crop_started.wait, 0.3)
+            assert provider.calls == 1
+            assert not first_request.done()
+
+            release_first_crop.set()
+            with pytest.raises(asyncio.CancelledError):
+                await first_request
+            result = await second_request
+            assert result.question_count == 1
+            assert second_crop_started.is_set()
+
+            async with factory() as check_session:
+                tasks = (
+                    await check_session.scalars(
+                        select(OCRTask).order_by(OCRTask.source_file_id)
+                    )
+                ).all()
+            statuses = {task.source_file_id: task.status for task in tasks}
+            assert statuses[first_source.id] == "failed"
+            assert statuses[second_source.id] == "succeeded"
+        finally:
+            release_first_crop.set()
+            for request in (first_request, second_request):
+                if request is not None and not request.done():
+                    request.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await request
+            await first_session.close()
+            await second_session.close()
             await engine.dispose()
 
     asyncio.run(scenario())
@@ -722,8 +998,7 @@ def test_pdf_without_corrected_image_keeps_original_and_warns(tmp_path):
                 )
             assert result.questions[0].crop_asset_id is None
             assert any(
-                "PDF" in warning and "原文件" in warning
-                for warning in result.warnings
+                "PDF" in warning and "原文件" in warning for warning in result.warnings
             )
             async with factory() as session:
                 assets = (
@@ -924,6 +1199,85 @@ def test_persisted_processing_task_returns_safe_in_progress_and_releases_key_loc
     asyncio.run(scenario())
 
 
+def test_expired_processing_task_is_reclaimed_by_a_new_request(tmp_path):
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        try:
+            user_id, source = await _source_asset(factory, settings)
+            provider = FakeProvider()
+            service = OCRService(provider, settings)
+            task = await _seed_processing_ocr_task(
+                factory,
+                service,
+                user_id,
+                source,
+                claim_token="expired-owner-token",
+                updated_at=datetime.now(timezone.utc)
+                - timedelta(seconds=settings.ocr_processing_lease_seconds + 1),
+            )
+
+            async with factory() as session:
+                result = await service.recognize(
+                    session,
+                    user_id=user_id,
+                    asset=source,
+                    pdf_page_number=1,
+                    local_request_id="reclaim-expired-processing",
+                )
+
+            assert result.question_count == 1
+            assert provider.calls == 1
+            async with factory() as session:
+                persisted = await session.get(OCRTask, task.id)
+            assert persisted is not None
+            assert persisted.status == "succeeded"
+            assert persisted.provider_request_id == result.request_id
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_unexpired_processing_task_is_not_reclaimed(tmp_path):
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        try:
+            user_id, source = await _source_asset(factory, settings)
+            provider = FakeProvider()
+            service = OCRService(provider, settings)
+            task = await _seed_processing_ocr_task(
+                factory,
+                service,
+                user_id,
+                source,
+                claim_token="current-owner-token",
+                updated_at=datetime.now(timezone.utc),
+            )
+
+            async with factory() as session:
+                with pytest.raises(APIError) as caught:
+                    await service.recognize(
+                        session,
+                        user_id=user_id,
+                        asset=source,
+                        pdf_page_number=1,
+                        local_request_id="preserve-current-processing",
+                    )
+
+            assert caught.value.status_code == 409
+            assert caught.value.code == "OCR_IN_PROGRESS"
+            assert provider.calls == 0
+            async with factory() as session:
+                persisted = await session.get(OCRTask, task.id)
+            assert persisted is not None
+            assert persisted.status == "processing"
+            assert persisted.provider_request_id == "current-owner-token"
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("page_number", [0, 3])
 def test_pdf_page_is_checked_against_real_file(page_number, tmp_path):
     async def scenario():
@@ -978,8 +1332,7 @@ def test_zero_area_crop_keeps_question_and_media(tmp_path):
             assert result.questions[0].crop_asset_id is None
             assert result.questions[0].figures[0].asset_id is None
             assert any(
-                "没有有效面积" in warning
-                for warning in result.questions[0].warnings
+                "没有有效面积" in warning for warning in result.questions[0].warnings
             )
         finally:
             await engine.dispose()
@@ -990,9 +1343,7 @@ def test_zero_area_crop_keeps_question_and_media(tmp_path):
 def test_cancellation_releases_provider_semaphore_and_marks_task_failed(tmp_path):
     async def scenario():
         settings, engine, factory = await _database(tmp_path)
-        settings = settings.model_copy(
-            update={"tencentcloud_ocr_max_concurrency": 1}
-        )
+        settings = settings.model_copy(update={"tencentcloud_ocr_max_concurrency": 1})
         gate = asyncio.Event()
         provider = FakeProvider(gate=gate)
         service = OCRService(provider, settings)
@@ -1130,7 +1481,11 @@ def test_failed_task_claim_is_atomic_without_process_key_lock(tmp_path):
                 await first_session.close()
                 await second_session.close()
 
-            claims = [outcome for outcome in outcomes if isinstance(outcome, tuple)]
+            claims = [
+                outcome
+                for outcome in outcomes
+                if not isinstance(outcome, BaseException)
+            ]
             errors = [outcome for outcome in outcomes if isinstance(outcome, APIError)]
             assert len(claims) == 1
             assert len(errors) == 1
@@ -1141,8 +1496,12 @@ def test_failed_task_claim_is_atomic_without_process_key_lock(tmp_path):
     asyncio.run(scenario())
 
 
-def test_failed_task_claim_statement_compiles_for_sqlite_and_postgresql():
-    statement = ocr_service_module._failed_task_claim_statement("key-123")
+def test_claimable_task_statement_compiles_for_sqlite_and_postgresql():
+    statement = ocr_service_module._claimable_task_statement(
+        "key-123",
+        "new-owner-token",
+        datetime(2026, 7, 14, tzinfo=timezone.utc),
+    )
 
     for dialect in (sqlite.dialect(), postgresql.dialect()):
         compiled = str(
@@ -1151,6 +1510,8 @@ def test_failed_task_claim_statement_compiles_for_sqlite_and_postgresql():
         assert "update ocr_tasks" in compiled
         assert "idempotency_key" in compiled
         assert "status = 'failed'" in compiled
+        assert "status = 'processing'" in compiled
+        assert "updated_at" in compiled
 
 
 def test_dual_window_clock_is_sampled_inside_the_atomic_section():
@@ -1330,6 +1691,42 @@ def test_no_question_uses_prd_error_code(tmp_path):
     asyncio.run(scenario())
 
 
+def test_post_response_failure_discards_unsafe_request_id_from_db_and_logs(
+    tmp_path, caplog
+):
+    unsafe_request_id = "AKID-secret-shaped-post-response-request-id"
+
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        try:
+            user_id, source = await _source_asset(factory, settings)
+            service = OCRService(NoQuestionProvider(unsafe_request_id), settings)
+            with caplog.at_level("INFO", logger="app.services.ocr.service"):
+                async with factory() as session:
+                    with pytest.raises(APIError) as caught:
+                        await service.recognize(
+                            session,
+                            user_id=user_id,
+                            asset=source,
+                            pdf_page_number=1,
+                            local_request_id="unsafe-post-response-request-id",
+                        )
+            assert caught.value.code == "OCR_NO_QUESTION"
+            async with factory() as session:
+                task = await session.scalar(select(OCRTask))
+            assert task is not None
+            assert task.status == "failed"
+            assert task.provider_request_id is None
+            assert unsafe_request_id not in caplog.text
+            assert unsafe_request_id not in " ".join(
+                str(vars(record)) for record in caplog.records
+            )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_oversized_corrected_base64_is_skipped_before_decode(
     tmp_path, monkeypatch, caplog
 ):
@@ -1450,9 +1847,37 @@ def test_crop_artifact_count_budget_skips_excess_assets(tmp_path):
     asyncio.run(scenario())
 
 
-def test_crop_png_total_byte_budget_skips_before_allocating_crop(
-    tmp_path, monkeypatch
-):
+def test_crop_attempt_budget_bounds_invalid_media_and_warning_growth(tmp_path):
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        settings = settings.model_copy(update={"ocr_crop_max_artifacts": 2})
+        try:
+            user_id, source = await _source_asset(factory, settings, color="red")
+            service = OCRService(MissingCoordMediaProvider(), settings)
+            async with factory() as session:
+                result = await service.recognize(
+                    session,
+                    user_id=user_id,
+                    asset=source,
+                    pdf_page_number=1,
+                    local_request_id="invalid-media-attempt-budget",
+                )
+
+            question = result.questions[0]
+            assert question.crop_asset_id is not None
+            assert len(question.figures) == 25
+            assert all(figure.asset_id is None for figure in question.figures)
+            assert sum("缺少有效坐标" in warning for warning in question.warnings) == 1
+            assert (
+                sum("裁剪图片数量上限" in warning for warning in result.warnings) == 1
+            )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_crop_png_total_byte_budget_skips_before_allocating_crop(tmp_path, monkeypatch):
     async def scenario():
         settings, engine, factory = await _database(tmp_path)
         settings = settings.model_copy(update={"ocr_crop_max_total_png_bytes": 1})
@@ -1484,8 +1909,7 @@ def test_crop_png_total_byte_budget_skips_before_allocating_crop(
             assert result.question_count == 1
             assert result.questions[0].crop_asset_id is None
             assert any(
-                "内存预算" in warning
-                for warning in result.questions[0].warnings
+                "内存预算" in warning for warning in result.questions[0].warnings
             )
         finally:
             await engine.dispose()
@@ -1561,6 +1985,93 @@ def test_cancellation_during_crop_write_waits_then_cleans_file_and_row(
     asyncio.run(scenario())
 
 
+def test_cancellation_during_failure_cleanup_waits_and_marks_task_failed(tmp_path):
+    class BlockingRollbackSession:
+        def __init__(self, session) -> None:
+            self._session = session
+            self.rollback_started = asyncio.Event()
+            self.release_rollback = asyncio.Event()
+            self.rollback_calls = 0
+
+        async def rollback(self):
+            self.rollback_calls += 1
+            if self.rollback_calls == 1:
+                self.rollback_started.set()
+                await self.release_rollback.wait()
+            await self._session.rollback()
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        try:
+            user_id, source = await _source_asset(factory, settings)
+            async with factory() as real_session:
+                session = BlockingRollbackSession(real_session)
+                service = OCRService(FailingProvider(), settings)
+                pending = asyncio.create_task(
+                    service.recognize(
+                        session,
+                        user_id=user_id,
+                        asset=source,
+                        pdf_page_number=1,
+                        local_request_id="cancel-failure-cleanup",
+                    )
+                )
+                await asyncio.wait_for(session.rollback_started.wait(), timeout=2)
+                pending.cancel()
+                await asyncio.sleep(0)
+                assert not pending.done()
+                session.release_rollback.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+
+            async with factory() as check_session:
+                task = await check_session.scalar(select(OCRTask))
+            assert task is not None
+            assert task.status == "failed"
+            assert task.error_code == "OCR_PROVIDER_ERROR"
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_failure_cleanup_removes_worker_files_even_when_database_rollback_fails(
+    tmp_path,
+):
+    class RollbackFailureSession:
+        async def rollback(self):
+            raise OSError("database unavailable")
+
+    async def scenario():
+        settings, engine, _ = await _database(tmp_path)
+        try:
+            storage_name = "failed-worker-crop.png"
+            generated_path = settings.upload_dir / storage_name
+            settings.upload_dir.mkdir(parents=True, exist_ok=True)
+            generated_path.write_bytes(_png_bytes())
+            service = OCRService(FakeProvider(), settings)
+
+            with pytest.raises(OSError, match="database unavailable"):
+                await service._mark_failed(
+                    RollbackFailureSession(),
+                    "task-id",
+                    "claim-token",
+                    APIError(500, "OCR_PROCESSING_FAILED", "OCR 结果处理失败"),
+                    generated_assets=[("asset-id", storage_name)],
+                    provider_request_id=None,
+                    preserve_committed_success=False,
+                )
+
+            assert not generated_path.exists()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_successful_but_ambiguous_commit_keeps_committed_assets_and_cache(tmp_path):
     class CommitUnknownSession:
         def __init__(self, session) -> None:
@@ -1621,6 +2132,675 @@ def test_successful_but_ambiguous_commit_keeps_committed_assets_and_cache(tmp_pa
                 )
             assert cached.question_count == 1
             assert provider.calls == 1
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+class ClaimCommitSession:
+    """Control one commit after its database side effect for claim regressions."""
+
+    def __init__(
+        self,
+        session,
+        *,
+        target_commit: int,
+        block_after_commit: bool = False,
+        raise_after_commit: bool = False,
+        late_exception: Exception | None = None,
+    ) -> None:
+        self._session = session
+        self._target_commit = target_commit
+        self._block_after_commit = block_after_commit
+        self._raise_after_commit = raise_after_commit
+        self._late_exception = late_exception
+        self.commit_calls = 0
+        self.committed = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def commit(self):
+        self.commit_calls += 1
+        await self._session.commit()
+        if self.commit_calls != self._target_commit:
+            return
+        self.committed.set()
+        if self._block_after_commit:
+            await self.release.wait()
+        if self._late_exception is not None:
+            raise self._late_exception
+        if self._raise_after_commit:
+            raise OSError("claim commit result unavailable")
+
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
+
+class BlockScalarAfterReadSession:
+    """Pause one scalar result after the database read has completed."""
+
+    def __init__(self, session, *, target_scalar: int) -> None:
+        self._session = session
+        self._target_scalar = target_scalar
+        self.scalar_calls = 0
+        self.read = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def scalar(self, *args, **kwargs):
+        value = await self._session.scalar(*args, **kwargs)
+        self.scalar_calls += 1
+        if self.scalar_calls == self._target_scalar:
+            self.read.set()
+            await self.release.wait()
+        return value
+
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
+
+async def _seed_failed_ocr_task(factory, service, user_id, source) -> OCRTask:
+    raw = Path(service._settings.upload_dir / source.storage_name).read_bytes()
+    source_hash = hashlib.sha256(raw).hexdigest()
+    key = service._idempotency_key(
+        user_id=user_id,
+        source_hash=source_hash,
+        pdf_page_number=1,
+    )
+    async with factory() as session:
+        task = OCRTask(
+            user_id=user_id,
+            source_file_id=source.id,
+            provider=service._provider.name,
+            api_name=API_NAME,
+            source_file_hash=source_hash,
+            pdf_page_number=1,
+            parameter_version=PARAMETER_VERSION,
+            idempotency_key=key,
+            status="failed",
+            error_code="OCR_PROVIDER_ERROR",
+            error_message="OCR 服务暂时不可用",
+        )
+        session.add(task)
+        await session.commit()
+        return task
+
+
+async def _seed_processing_ocr_task(
+    factory,
+    service,
+    user_id,
+    source,
+    *,
+    claim_token: str,
+    updated_at: datetime,
+) -> OCRTask:
+    raw = Path(service._settings.upload_dir / source.storage_name).read_bytes()
+    source_hash = hashlib.sha256(raw).hexdigest()
+    key = service._idempotency_key(
+        user_id=user_id,
+        source_hash=source_hash,
+        pdf_page_number=1,
+    )
+    async with factory() as session:
+        task = OCRTask(
+            user_id=user_id,
+            source_file_id=source.id,
+            provider=service._provider.name,
+            api_name=API_NAME,
+            source_file_hash=source_hash,
+            pdf_page_number=1,
+            parameter_version=PARAMETER_VERSION,
+            idempotency_key=key,
+            status="processing",
+            provider_request_id=claim_token,
+            updated_at=updated_at,
+        )
+        session.add(task)
+        await session.commit()
+        return task
+
+
+def test_late_success_cannot_overwrite_reclaimed_then_cancelled_task(tmp_path):
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        old_session = factory()
+        try:
+            user_id, source = await _source_asset(factory, settings, color="red")
+            old_provider = GatedCroppingProvider()
+            old_service = OCRService(old_provider, settings)
+            old_request = asyncio.create_task(
+                old_service.recognize(
+                    old_session,
+                    user_id=user_id,
+                    asset=source,
+                    pdf_page_number=1,
+                    local_request_id="old-worker-late-success",
+                )
+            )
+            await asyncio.wait_for(old_provider.started.wait(), timeout=2)
+
+            async with factory() as session:
+                task = await session.scalar(select(OCRTask))
+                assert task is not None
+                old_claim_token = task.provider_request_id
+                await session.execute(
+                    update(OCRTask)
+                    .where(OCRTask.id == task.id)
+                    .values(
+                        updated_at=datetime.now(timezone.utc)
+                        - timedelta(seconds=settings.ocr_processing_lease_seconds + 1)
+                    )
+                )
+                await session.commit()
+
+            new_service = OCRService(FakeProvider(), settings)
+            raw = (settings.upload_dir / source.storage_name).read_bytes()
+            source_hash = hashlib.sha256(raw).hexdigest()
+            key = new_service._idempotency_key(
+                user_id=user_id,
+                source_hash=source_hash,
+                pdf_page_number=1,
+            )
+            async with factory() as session:
+                new_claim = await new_service._claim_task(
+                    session,
+                    user_id=user_id,
+                    asset=source,
+                    source_hash=source_hash,
+                    pdf_page_number=1,
+                    idempotency_key=key,
+                )
+                assert new_claim.owner_token is not None
+                assert new_claim.owner_token != old_claim_token
+                await new_service._cancel_owned_claim(
+                    session,
+                    idempotency_key=key,
+                    claim_token=new_claim.owner_token,
+                )
+
+            old_provider.release.set()
+            with pytest.raises(APIError) as caught:
+                await old_request
+            assert caught.value.code == "OCR_IN_PROGRESS"
+
+            async with factory() as session:
+                persisted = await session.scalar(select(OCRTask))
+                assets = (
+                    await session.scalars(
+                        select(UploadedAsset).where(UploadedAsset.user_id == user_id)
+                    )
+                ).all()
+            assert persisted is not None
+            assert persisted.status == "failed"
+            assert persisted.provider_request_id is None
+            assert persisted.error_code == "OCR_CANCELLED"
+            assert [asset.id for asset in assets] == [source.id]
+            assert sorted(path.name for path in settings.upload_dir.iterdir()) == [
+                source.storage_name
+            ]
+        finally:
+            old_provider.release.set()
+            if not old_request.done():
+                old_request.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await old_request
+            await old_session.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_late_failure_cannot_overwrite_reclaimed_processing_claim(tmp_path):
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        old_session = factory()
+        try:
+            user_id, source = await _source_asset(factory, settings)
+            old_provider = GatedFailingProvider()
+            old_service = OCRService(old_provider, settings)
+            old_request = asyncio.create_task(
+                old_service.recognize(
+                    old_session,
+                    user_id=user_id,
+                    asset=source,
+                    pdf_page_number=1,
+                    local_request_id="old-worker-late-failure",
+                )
+            )
+            await asyncio.wait_for(old_provider.started.wait(), timeout=2)
+
+            async with factory() as session:
+                task = await session.scalar(select(OCRTask))
+                assert task is not None
+                old_claim_token = task.provider_request_id
+                await session.execute(
+                    update(OCRTask)
+                    .where(OCRTask.id == task.id)
+                    .values(
+                        updated_at=datetime.now(timezone.utc)
+                        - timedelta(seconds=settings.ocr_processing_lease_seconds + 1)
+                    )
+                )
+                await session.commit()
+
+            new_service = OCRService(FakeProvider(), settings)
+            raw = (settings.upload_dir / source.storage_name).read_bytes()
+            source_hash = hashlib.sha256(raw).hexdigest()
+            key = new_service._idempotency_key(
+                user_id=user_id,
+                source_hash=source_hash,
+                pdf_page_number=1,
+            )
+            async with factory() as session:
+                new_claim = await new_service._claim_task(
+                    session,
+                    user_id=user_id,
+                    asset=source,
+                    source_hash=source_hash,
+                    pdf_page_number=1,
+                    idempotency_key=key,
+                )
+            assert new_claim.owner_token is not None
+            assert new_claim.owner_token != old_claim_token
+
+            old_provider.release.set()
+            with pytest.raises(APIError) as caught:
+                await old_request
+            assert caught.value.code == "OCR_PROVIDER_ERROR"
+
+            async with factory() as session:
+                persisted = await session.scalar(select(OCRTask))
+            assert persisted is not None
+            assert persisted.status == "processing"
+            assert persisted.provider_request_id == new_claim.owner_token
+            assert persisted.error_code is None
+        finally:
+            old_provider.release.set()
+            if not old_request.done():
+                old_request.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await old_request
+            await old_session.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("existing_failed", "target_commit"),
+    [(False, 2), (True, 1)],
+    ids=["new-insert", "failed-cas"],
+)
+def test_cancelled_claim_commit_does_not_leave_processing_task(
+    existing_failed, target_commit, tmp_path
+):
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        try:
+            user_id, source = await _source_asset(factory, settings)
+            provider = FakeProvider()
+            service = OCRService(provider, settings)
+            if existing_failed:
+                await _seed_failed_ocr_task(factory, service, user_id, source)
+
+            async with factory() as real_session:
+                wrapped = ClaimCommitSession(
+                    real_session,
+                    target_commit=target_commit,
+                    block_after_commit=True,
+                )
+                pending = asyncio.create_task(
+                    service.recognize(
+                        wrapped,
+                        user_id=user_id,
+                        asset=source,
+                        pdf_page_number=1,
+                        local_request_id="cancelled-claim",
+                    )
+                )
+                await asyncio.wait_for(wrapped.committed.wait(), timeout=2)
+                pending.cancel()
+                await asyncio.sleep(0)
+                wrapped.release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+
+            assert provider.calls == 0
+            async with factory() as check_session:
+                task = await check_session.scalar(select(OCRTask))
+            assert task is not None
+            assert task.status == "failed"
+            assert task.error_code == "OCR_CANCELLED"
+
+            async with factory() as retry_session:
+                result = await service.recognize(
+                    retry_session,
+                    user_id=user_id,
+                    asset=source,
+                    pdf_page_number=1,
+                    local_request_id="cancelled-claim-retry",
+                )
+            assert result.question_count == 1
+            assert provider.calls == 1
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("existing_failed", "target_commit", "late_error"),
+    [
+        (False, 2, "oserror"),
+        (True, 1, "oserror"),
+        (False, 2, "integrity"),
+    ],
+    ids=["new-insert-oserror", "failed-cas-oserror", "new-insert-integrity"],
+)
+def test_cancelled_claim_commit_late_error_preserves_cancellation(
+    existing_failed, target_commit, late_error, tmp_path
+):
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        try:
+            user_id, source = await _source_asset(factory, settings)
+            provider = FakeProvider()
+            service = OCRService(provider, settings)
+            if existing_failed:
+                await _seed_failed_ocr_task(factory, service, user_id, source)
+            exception = (
+                IntegrityError("commit", {}, Exception("late integrity error"))
+                if late_error == "integrity"
+                else OSError("claim commit result unavailable")
+            )
+
+            async with factory() as real_session:
+                wrapped = ClaimCommitSession(
+                    real_session,
+                    target_commit=target_commit,
+                    block_after_commit=True,
+                    late_exception=exception,
+                )
+                pending = asyncio.create_task(
+                    service.recognize(
+                        wrapped,
+                        user_id=user_id,
+                        asset=source,
+                        pdf_page_number=1,
+                        local_request_id="cancelled-late-claim-error",
+                    )
+                )
+                await asyncio.wait_for(wrapped.committed.wait(), timeout=2)
+                pending.cancel()
+                await asyncio.sleep(0)
+                wrapped.release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+
+            assert provider.calls == 0
+            async with factory() as check_session:
+                task = await check_session.scalar(select(OCRTask))
+            assert task is not None
+            assert task.status == "failed"
+            assert task.error_code == "OCR_CANCELLED"
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_late_noop_claim_error_does_not_modify_other_owner(tmp_path):
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        try:
+            user_id, source = await _source_asset(factory, settings)
+            provider = FakeProvider()
+            service = OCRService(provider, settings)
+            seeded = await _seed_failed_ocr_task(factory, service, user_id, source)
+            async with factory() as session:
+                task = await session.get(OCRTask, seeded.id)
+                assert task is not None
+                task.status = "processing"
+                task.provider_request_id = "other-owner-token"
+                task.error_code = None
+                task.error_message = None
+                await session.commit()
+
+            async with factory() as real_session:
+                wrapped = ClaimCommitSession(
+                    real_session,
+                    target_commit=1,
+                    block_after_commit=True,
+                    late_exception=OSError("claim commit result unavailable"),
+                )
+                pending = asyncio.create_task(
+                    service.recognize(
+                        wrapped,
+                        user_id=user_id,
+                        asset=source,
+                        pdf_page_number=1,
+                        local_request_id="cancelled-other-owner-claim",
+                    )
+                )
+                await asyncio.wait_for(wrapped.committed.wait(), timeout=2)
+                pending.cancel()
+                await asyncio.sleep(0)
+                wrapped.release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+
+            assert provider.calls == 0
+            async with factory() as check_session:
+                task = await check_session.get(OCRTask, seeded.id)
+            assert task is not None
+            assert task.status == "processing"
+            assert task.provider_request_id == "other-owner-token"
+            assert task.error_code is None
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "claim_path",
+    ["failed-cas", "new-insert-oserror", "new-insert-integrity"],
+)
+def test_cancelled_owned_claim_lookup_marks_task_failed(claim_path, tmp_path):
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        try:
+            user_id, source = await _source_asset(factory, settings)
+            provider = FakeProvider()
+            service = OCRService(provider, settings)
+            if claim_path == "failed-cas":
+                await _seed_failed_ocr_task(factory, service, user_id, source)
+
+            async with factory() as real_session:
+                claim_session = real_session
+                target_scalar = 1
+                if claim_path != "failed-cas":
+                    exception = (
+                        IntegrityError(
+                            "commit",
+                            {},
+                            Exception("late integrity error"),
+                        )
+                        if claim_path == "new-insert-integrity"
+                        else OSError("claim commit result unavailable")
+                    )
+                    claim_session = ClaimCommitSession(
+                        real_session,
+                        target_commit=2,
+                        late_exception=exception,
+                    )
+                    target_scalar = 2
+                wrapped = BlockScalarAfterReadSession(
+                    claim_session,
+                    target_scalar=target_scalar,
+                )
+                pending = asyncio.create_task(
+                    service.recognize(
+                        wrapped,
+                        user_id=user_id,
+                        asset=source,
+                        pdf_page_number=1,
+                        local_request_id="cancelled-owned-claim-lookup",
+                    )
+                )
+                await asyncio.wait_for(wrapped.read.wait(), timeout=2)
+                pending.cancel()
+                await asyncio.sleep(0)
+                wrapped.release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+
+            assert provider.calls == 0
+            async with factory() as check_session:
+                task = await check_session.scalar(select(OCRTask))
+            assert task is not None
+            assert task.status == "failed"
+            assert task.provider_request_id is None
+            assert task.error_code == "OCR_CANCELLED"
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_claim_lookup_does_not_modify_other_owner(tmp_path):
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        try:
+            user_id, source = await _source_asset(factory, settings)
+            provider = FakeProvider()
+            service = OCRService(provider, settings)
+            seeded = await _seed_failed_ocr_task(factory, service, user_id, source)
+            async with factory() as session:
+                task = await session.get(OCRTask, seeded.id)
+                assert task is not None
+                task.status = "processing"
+                task.provider_request_id = "other-owner-token"
+                task.error_code = None
+                task.error_message = None
+                await session.commit()
+
+            async with factory() as real_session:
+                wrapped = BlockScalarAfterReadSession(
+                    real_session,
+                    target_scalar=1,
+                )
+                pending = asyncio.create_task(
+                    service.recognize(
+                        wrapped,
+                        user_id=user_id,
+                        asset=source,
+                        pdf_page_number=1,
+                        local_request_id="cancelled-other-owner-lookup",
+                    )
+                )
+                await asyncio.wait_for(wrapped.read.wait(), timeout=2)
+                pending.cancel()
+                await asyncio.sleep(0)
+                wrapped.release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+
+            assert provider.calls == 0
+            async with factory() as check_session:
+                task = await check_session.get(OCRTask, seeded.id)
+            assert task is not None
+            assert task.status == "processing"
+            assert task.provider_request_id == "other-owner-token"
+            assert task.error_code is None
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("existing_failed", "target_commit"),
+    [(False, 2), (True, 1)],
+    ids=["new-insert", "failed-cas"],
+)
+def test_ambiguous_successful_claim_commit_continues_without_stuck_processing(
+    existing_failed, target_commit, tmp_path
+):
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        try:
+            user_id, source = await _source_asset(factory, settings)
+            provider = FakeProvider()
+            service = OCRService(provider, settings)
+            if existing_failed:
+                await _seed_failed_ocr_task(factory, service, user_id, source)
+
+            async with factory() as real_session:
+                wrapped = ClaimCommitSession(
+                    real_session,
+                    target_commit=target_commit,
+                    raise_after_commit=True,
+                )
+                result = await service.recognize(
+                    wrapped,
+                    user_id=user_id,
+                    asset=source,
+                    pdf_page_number=1,
+                    local_request_id="ambiguous-claim",
+                )
+
+            assert result.question_count == 1
+            assert provider.calls == 1
+            async with factory() as check_session:
+                task = await check_session.scalar(select(OCRTask))
+            assert task is not None
+            assert task.status == "succeeded"
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_ambiguous_noop_claim_does_not_modify_another_instances_processing_task(
+    tmp_path,
+):
+    async def scenario():
+        settings, engine, factory = await _database(tmp_path)
+        try:
+            user_id, source = await _source_asset(factory, settings)
+            provider = FakeProvider()
+            service = OCRService(provider, settings)
+            seeded = await _seed_failed_ocr_task(factory, service, user_id, source)
+            async with factory() as session:
+                task = await session.get(OCRTask, seeded.id)
+                assert task is not None
+                task.status = "processing"
+                task.error_code = None
+                task.error_message = None
+                await session.commit()
+
+            async with factory() as real_session:
+                wrapped = ClaimCommitSession(
+                    real_session,
+                    target_commit=1,
+                    raise_after_commit=True,
+                )
+                with pytest.raises(APIError) as caught:
+                    await service.recognize(
+                        wrapped,
+                        user_id=user_id,
+                        asset=source,
+                        pdf_page_number=1,
+                        local_request_id="other-instance-processing",
+                    )
+            assert caught.value.code == "OCR_IN_PROGRESS"
+            assert provider.calls == 0
+            async with factory() as check_session:
+                task = await check_session.get(OCRTask, seeded.id)
+            assert task is not None
+            assert task.status == "processing"
+            assert task.error_code is None
         finally:
             await engine.dispose()
 

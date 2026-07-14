@@ -396,7 +396,7 @@ describe("proxyApiRequest", () => {
   it("encodes catch-all path segments and preserves the original query", async () => {
     process.env.API_INTERNAL_URL = PRIVATE_API_URL;
     process.env.RAILWAY_PUBLIC_DOMAIN = PUBLIC_DOMAIN;
-    const upstream = vi.fn(async () => new Response(null));
+    const upstream = vi.fn<FetchLike>().mockResolvedValue(new Response(null));
     vi.stubGlobal("fetch", upstream);
 
     await proxyApiRequest(

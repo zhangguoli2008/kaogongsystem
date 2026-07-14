@@ -62,7 +62,7 @@ docker compose exec api alembic current
 docker compose exec api alembic upgrade head
 ```
 
-## Provider 模式
+## AI Provider 模式
 
 `.env` 中的 `PROVIDER_MODE` 支持三种值：
 
@@ -80,6 +80,29 @@ OPENAI_MODEL=gpt-5.5
 
 保存后用 `docker compose up --build -d` 重建/重启服务。不要把 `.env` 或真实密钥提交到版本库；仓库只提交不含密钥的 `.env.example`。
 
+## 试卷切题 OCR
+
+OCR 与 AI Provider 独立。默认 `OCR_PROVIDER=mock`，会返回明确标注为演示数据的多题结果，不调用外部服务。正式 OCR 使用腾讯云 `QuestionSplitOCR`，支持 PNG、JPG/JPEG、BMP、PDF 指定页、多题题干与选项、Figure、Table、坐标和受控裁剪图。识别只产生可编辑草稿，不会自动保存答案、解析或触发 AI。
+
+后端 `.env` 仅需写入轮换后的子账号凭证：
+
+```dotenv
+OCR_PROVIDER=tencent_question_split
+TENCENTCLOUD_SECRET_ID=
+TENCENTCLOUD_SECRET_KEY=
+TENCENTCLOUD_REGION=
+OCR_PROCESSING_LEASE_SECONDS=180
+MAX_UPLOAD_BYTES=10485760
+UPLOAD_MAX_CONCURRENCY=2
+UPLOAD_QUEUE_TIMEOUT_SECONDS=5
+UPLOAD_RATE_LIMIT_PER_MINUTE=10
+UPLOAD_RATE_LIMIT_PER_HOUR=100
+```
+
+`OCR_PROCESSING_LEASE_SECONDS` 默认 180 秒，且必须至少为“排队超时 + 单次请求超时 ×（重试次数 + 1）+ 30 秒”，避免没有 heartbeat 时误回收仍在正常裁剪或提交的 worker。API 进程意外退出后，超过租约仍为 `processing` 的任务可由新请求原子回收；未过期任务继续返回 409，避免重复计费。完整的开通、最小权限、配置边界、测试、计费和排障说明见 [QuestionSplitOCR 接入与运维文档](docs/tencent-question-split-ocr.md)。真实密钥绝不能写入 Web 环境变量、源码或 Git。
+
+上传大小按 Base64 编码后 1–10 MiB 配置。API 的 ASGI 入口会在 multipart 解析和鉴权前同时检查 `Content-Length` 与实际流式字节数；标准配置最多接收 7.5 MiB 原文件加 64 KiB multipart 封装，并用共享入口 Semaphore 把未登录请求也限制在 `UPLOAD_MAX_CONCURRENCY` 内。文件读取有界，图片/PDF 检查、SHA-256 和写盘在线程池中执行；请求取消时会等实际 worker 结束并清理未提交文件后才释放处理 Semaphore。排队超过 `UPLOAD_QUEUE_TIMEOUT_SECONDS` 或同一用户超过 10 次/分钟、100 次/小时会返回中文 429。当前 Railway 拓扑保持一个 API 副本，因此进程级并发与双窗口限流就是部署全局边界。
+
 ## 在宿主机运行测试
 
 需要 Python 3.12、[uv](https://docs.astral.sh/uv/) 和 Node.js 24：
@@ -93,6 +116,7 @@ cd ../web
 npm ci
 npm test -- --run
 npm run lint
+npx tsc --noEmit
 npm run build
 ```
 
@@ -106,7 +130,7 @@ npm run build
 
 ## Railway 正式环境
 
-Railway 的创建、变量注入、CLI 直传、检查与回滚步骤见 [Railway 部署运行手册](docs/deployment/railway.md)。正式环境的浏览器请求始终使用 Web 同源 `/api/v1`，由 Next.js 在服务端通过 Railway 私网代理到 API；不要把 API 私网地址配置到浏览器端。
+Railway 的创建、变量注入、CLI 直传、检查与回滚步骤见 [Railway 部署运行手册](docs/deployment/railway.md)。正式环境的浏览器请求始终使用 Web 同源 `/api/v1`，由 Next.js 在服务端通过 Railway 私网代理到 API；不要把 API 私网地址配置到浏览器端。建议先以演示 AI + Mock OCR 完成部署验收，再注入轮换后的腾讯子账号密钥并切换真实 OCR。
 
 完成部署后，在仓库根目录提供 `WEB_URL` 与 `API_URL` 即可运行 `make prod-smoke`。正式环境不得运行 `python -m app.seed`，也不得复制本地数据库或上传目录。
 

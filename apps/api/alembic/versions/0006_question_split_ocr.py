@@ -55,7 +55,9 @@ def upgrade() -> None:
             "status IN ('processing', 'succeeded', 'failed')",
             name="ck_ocr_tasks_status",
         ),
-        sa.ForeignKeyConstraint(["source_file_id"], ["uploaded_assets.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(
+            ["source_file_id"], ["uploaded_assets.id"], ondelete="CASCADE"
+        ),
         sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("idempotency_key"),

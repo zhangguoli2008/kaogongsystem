@@ -58,6 +58,4 @@ def downgrade() -> None:
     op.drop_index("ix_review_records_question_id", table_name="review_records")
     op.drop_table("review_records")
     with op.batch_alter_table("user_settings") as batch_op:
-        batch_op.drop_constraint(
-            "ck_user_settings_daily_review_limit", type_="check"
-        )
+        batch_op.drop_constraint("ck_user_settings_daily_review_limit", type_="check")

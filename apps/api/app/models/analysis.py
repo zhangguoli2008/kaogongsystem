@@ -34,7 +34,7 @@ class Analysis(Base):
     suggested_error_reason: Mapped[str | None] = mapped_column(
         String(20), nullable=True
     )
-    raw_response: Mapped[dict] = mapped_column(
+    raw_response: Mapped[dict[str, object]] = mapped_column(
         JSON, nullable=False, default=dict, server_default="{}"
     )
     provider_name: Mapped[str] = mapped_column(String(100), nullable=False)

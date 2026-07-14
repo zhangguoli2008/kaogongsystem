@@ -122,7 +122,9 @@ def test_demo_provider_analysis_uses_answers_and_explanation_without_echoing_the
         DemoProvider().analyze(analysis_input().model_copy(update={"user_answer": "B"}))
     )
     correct = asyncio.run(
-        DemoProvider().analyze(analysis_input().model_copy(update={"correct_answer": "A"}))
+        DemoProvider().analyze(
+            analysis_input().model_copy(update={"correct_answer": "A"})
+        )
     )
     missing_explanation = asyncio.run(
         DemoProvider().analyze(
@@ -178,7 +180,11 @@ def test_openai_provider_sends_data_url_and_strict_schema():
     assert result.is_demo is False
     image = seen["input"][0]["content"][1]
     assert image["type"] == "input_image"
-    assert image["image_url"] == "data:image/png;base64," + base64.b64encode(b"hello").decode()
+    assert (
+        image["image_url"]
+        == "data:image/png;base64," + base64.b64encode(b"hello").decode()
+    )
+    assert image["detail"] == "auto"
     assert seen["text"]["format"]["type"] == "json_schema"
     assert seen["text"]["format"]["strict"] is True
     assert seen["text"]["format"]["schema"]["additionalProperties"] is False
@@ -259,11 +265,13 @@ def test_openai_provider_analyze_sends_images_separately_from_text_json():
             "type": "input_image",
             "image_url": "data:image/png;base64,"
             + base64.b64encode(b"first-private-image").decode(),
+            "detail": "auto",
         },
         {
             "type": "input_image",
             "image_url": "data:image/jpeg;base64,"
             + base64.b64encode(b"second-private-image").decode(),
+            "detail": "auto",
         },
     ]
     assert "data:image" not in content[0]["text"]

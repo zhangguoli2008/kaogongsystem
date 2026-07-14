@@ -1,6 +1,6 @@
 # Railway 正式环境部署运行手册
 
-本手册用于把当前已审核的源码直接上传到 Railway 的 `production` 环境。目标拓扑固定为一个 `Postgres`、一个 `api`、一个 `web` 和一个挂载到 API `/data/uploads` 的持久卷。生产环境使用演示 AI，不配置 `OPENAI_API_KEY`。
+本手册用于把当前已审核的源码直接上传到 Railway 的 `production` 环境。目标拓扑固定为一个 `Postgres`、一个 `api`、一个 `web` 和一个挂载到 API `/data/uploads` 的持久卷。生产环境使用演示 AI，不配置 `OPENAI_API_KEY`。OCR 与 AI 独立：首次部署默认使用 Mock OCR 完成无费用验收；只有注入轮换后的腾讯云子账号密钥后，才切换 `tencent_question_split`。
 
 ## 安全边界与停止条件
 
@@ -10,6 +10,7 @@
 - Railway CLI 固定为 5.26.0；不要使用未固定版本的全局 CLI。
 - 不运行 `python -m app.seed`，不复制本地数据库或上传目录。
 - 不运行 `railway variable list --json`、`--kv` 或任何会显示变量原值的命令。
+- 不部署曾出现在聊天、截图或日志中的腾讯云密钥；先在 CAM 禁用旧密钥并创建新密钥。
 - 不启用 shell tracing，不在命令行、日志、截图或 QA 文档中记录 JWT、密码、Cookie、数据库 URL 或 Railway token。
 - Railway 要求 OAuth/设备确认时停下，交给用户在可见页面完成。
 - Railway 要求付费或升级、发现同名项目/服务/域名/卷、要求选择未知 workspace、迁移失败或 `/ready` 非 200 时立即停止，不猜测、不重复创建。
@@ -31,6 +32,7 @@ project_list=""
 proxy_secret_file=""
 secret_file=""
 state_file=""
+real_state_file=""
 
 cleanup_local_artifacts() {
   if [[ -n ${run_tmp:-} && -d ${run_tmp:-} ]]; then
@@ -363,11 +365,29 @@ railway_cli variable set \
   'ALLOWED_ORIGINS=["https://${{web.RAILWAY_PUBLIC_DOMAIN}}"]' \
   'ALLOWED_HOSTS=["${{api.RAILWAY_PUBLIC_DOMAIN}}","api.railway.internal","healthcheck.railway.app"]' \
   PROVIDER_MODE=demo \
+  OCR_PROVIDER=mock \
+  TENCENTCLOUD_OCR_TIMEOUT_SECONDS=30 \
+  TENCENTCLOUD_OCR_MAX_CONCURRENCY=2 \
+  TENCENTCLOUD_OCR_QUEUE_TIMEOUT_SECONDS=5 \
+  TENCENTCLOUD_OCR_MAX_RETRIES=2 \
+  OCR_PROCESSING_LEASE_SECONDS=180 \
+  OCR_RATE_LIMIT_PER_MINUTE=5 \
+  OCR_RATE_LIMIT_PER_HOUR=50 \
+  OCR_CORRECTED_IMAGE_MAX_BYTES=10485760 \
+  OCR_CORRECTED_IMAGES_MAX_TOTAL_BYTES=10485760 \
+  OCR_CROP_MAX_ARTIFACTS=100 \
+  OCR_CROP_MAX_TOTAL_PNG_BYTES=10485760 \
   UPLOAD_DIR=/data/uploads \
   MAX_UPLOAD_BYTES=10485760 \
+  UPLOAD_MAX_CONCURRENCY=2 \
+  UPLOAD_QUEUE_TIMEOUT_SECONDS=5 \
+  UPLOAD_RATE_LIMIT_PER_MINUTE=10 \
+  UPLOAD_RATE_LIMIT_PER_HOUR=100 \
   PORT=8000 \
   RAILWAY_RUN_UID=0 >/dev/null
 ```
+
+`OCR_PROCESSING_LEASE_SECONDS` 允许 60–3600 秒，默认 180 秒，并必须至少等于“排队超时 + 请求超时 ×（重试次数 + 1）+ 30 秒”；默认最低要求为 125 秒。该交叉校验避免没有 heartbeat 时误回收仍在裁剪、写盘或提交的 worker。未过期的同一幂等任务返回 409；worker 意外退出后，过期任务才会被新 claim token 原子回收。上传保持 Base64 编码后 10 MiB、全局并发 2、排队 5 秒及每用户 10 次/分钟、100 次/小时；ASGI 入口在 multipart 与鉴权前按“7.5 MiB 原文件 + 64 KiB 封装”限制声明和 chunked 实际字节，并用独立 Semaphore 约束未登录并发。当前正式环境只运行一个 API 副本，使进程级入口/处理 Semaphore 与双窗口限流构成部署全局边界。其他 OCR/上传数值变量的合法边界见 `docs/tencent-question-split-ocr.md`，越界配置会让 API 启动失败，部署时不要绕过校验。
 
 Web 浏览器端只烘焙同源相对路径；私网地址和共享密钥只存在于服务端运行环境。`RAILWAY_PUBLIC_DOMAIN` 由 Railway 自动提供，代理用它生成可信 forwarded origin。Web 会删除浏览器伪造的共享密钥头并覆写为运行时密钥，API 只在密钥恒定时间比对、Railway 边缘标记和合法 `X-Real-IP` 同时通过时才按真实客户端限流；密钥头永不回传浏览器。
 
@@ -380,6 +400,34 @@ railway_cli variable set \
 ```
 
 不要运行变量列表命令来“确认”键名，因为 CLI 会同时返回原值。新项目只应存在本节显式设置的键；`OPENAI_API_KEY` 不得设置。API 的 fail-closed 启动校验和后续 `/ready` 是运行时证据。
+
+### 3.1 可选：切换真实腾讯 QuestionSplitOCR
+
+首次 Mock OCR 验收通过、并且已在 CAM 轮换密钥后，才执行本节。密钥只通过 stdin 注入 API 服务，不进入命令参数、shell 历史或仓库；输入时终端不回显：
+
+```bash
+set +x
+read -r -s -p 'New Tencent SecretId: ' tencent_secret_id
+printf '\n'
+printf '%s' "$tencent_secret_id" |
+  railway_cli variable set TENCENTCLOUD_SECRET_ID --stdin \
+    --service api --environment production --skip-deploys >/dev/null
+unset tencent_secret_id
+
+read -r -s -p 'New Tencent SecretKey: ' tencent_secret_key
+printf '\n'
+printf '%s' "$tencent_secret_key" |
+  railway_cli variable set TENCENTCLOUD_SECRET_KEY --stdin \
+    --service api --environment production --skip-deploys >/dev/null
+unset tencent_secret_key
+
+railway_cli variable set \
+  --service api --environment production --skip-deploys \
+  'TENCENTCLOUD_REGION=' \
+  OCR_PROVIDER=tencent_question_split >/dev/null
+```
+
+`TENCENTCLOUD_REGION` 允许空值，上面的命令显式保留为空且不会读取或输出任何密钥；Endpoint、`UseNewModel=false`、`EnableImageCrop=true` 和 `EnableOnlyDetectBorder=false` 固定在后端安全契约中。变量设置完成后按第 4 节重新上传 API；`GET /api/v1/ocr/status` 必须显示 `provider=tencent_question_split` 且 `configured=true`。若任一密钥缺失，API 仍会启动，但 OCR 明确返回 `OCR_NOT_CONFIGURED`。
 
 ## 4. 从干净 SHA 依次部署
 
@@ -443,8 +491,8 @@ railway_cli ssh --service api --environment production true
 migration_current="$(
   railway_cli ssh --service api --environment production alembic current
 )"
-test "$migration_current" = "0005_review_records (head)"
-printf 'alembic_revision=0005_review_records\n'
+test "$migration_current" = "0006_question_split_ocr (head)"
+printf 'alembic_revision=0006_question_split_ocr\n'
 
 railway_cli ssh --service api --environment production python - <<'PY'
 import json
@@ -575,6 +623,88 @@ WEB_URL="$WEB_URL" API_URL="$API_URL" SMOKE_STATE_FILE="$state_file" \
   bash scripts/production-smoke.sh
 ```
 
+上面的首次 smoke 默认断言 `OCR_PROVIDER=mock`，不会调用腾讯，并可继续使用仓库内的 Dashboard 示例图。切换真实 OCR 后，如需显式做一次端到端付费 smoke，必须同时提供一张真实、非敏感公考试题图片的绝对路径；脚本不会为真实腾讯调用回退到 Dashboard 图。脚本只发出一个 OCR HTTP 请求，但无法覆盖 API 服务端重试配置，所以必须先把 API 的 `TENCENTCLOUD_OCR_MAX_RETRIES` 临时设为 `0` 并等到新部署健康。以下子 shell 的 EXIT trap 会在成功、失败或中断后把它恢复为 `2`，重新部署并验证；恢复失败时不得继续验收：
+
+```bash
+SMOKE_IMAGE_PATH=/absolute/path/to/non-sensitive-question.png
+test -f "$SMOKE_IMAGE_PATH"
+real_state_file=$(mktemp "$run_tmp/tencent-smoke-state.XXXXXX")
+chmod 600 "$real_state_file"
+
+(
+  set -euo pipefail
+  retry_override_started=0
+
+  wait_api_retry_config() {
+    local expected=$1
+    local ready=0
+    local attempt
+    for attempt in $(seq 1 60); do
+      if curl --fail --silent --show-error --connect-timeout 5 --max-time 10 \
+        --proto '=https' "$API_URL/ready" >/dev/null 2>&1 &&
+        railway_cli ssh --service api --environment production \
+          python - "$expected" <<'PY'
+import os
+import sys
+
+if os.environ.get("TENCENTCLOUD_OCR_MAX_RETRIES") != sys.argv[1]:
+    raise SystemExit(1)
+PY
+      then
+        ready=1
+        break
+      fi
+      sleep 2
+    done
+    test "$ready" = 1
+  }
+
+  restore_tencent_retries() {
+    local original_status=$?
+    local restore_status=0
+    trap - EXIT HUP INT TERM
+    if [[ "$retry_override_started" = 1 ]]; then
+      set +e
+      railway_cli variable set \
+        --service api --environment production --skip-deploys \
+        TENCENTCLOUD_OCR_MAX_RETRIES=2 >/dev/null &&
+        railway_cli redeploy \
+          --service api --environment production --yes &&
+        wait_api_retry_config 2
+      restore_status=$?
+      set -e
+    fi
+    if [[ "$restore_status" != 0 ]]; then
+      echo 'STOP: failed to restore and verify Tencent OCR retries=2' >&2
+      exit 1
+    fi
+    exit "$original_status"
+  }
+
+  trap restore_tencent_retries EXIT
+  trap 'exit 130' HUP INT TERM
+  retry_override_started=1
+  railway_cli variable set \
+    --service api --environment production --skip-deploys \
+    TENCENTCLOUD_OCR_MAX_RETRIES=0 >/dev/null
+  railway_cli redeploy --service api --environment production --yes
+  wait_api_retry_config 0
+
+  SMOKE_PASSWORD=$(<"$secret_file") \
+  EXPECTED_OCR_PROVIDER=tencent_question_split \
+  SMOKE_IMAGE_PATH="$SMOKE_IMAGE_PATH" \
+  WEB_URL="$WEB_URL" API_URL="$API_URL" SMOKE_STATE_FILE="$real_state_file" \
+    bash scripts/production-smoke.sh
+)
+
+# 只有真实调用和 retries=2 恢复验证都成功后，才用真实 smoke 的状态
+# 原子替换首次 Mock 状态；后续重启复验因此只读取这次已保存的上传和题目。
+mv -f -- "$real_state_file" "$state_file"
+real_state_file=""
+```
+
+真实付费 smoke 使用 `$run_tmp` 中独立的 mode-0600 `real_state_file`，不会复用首次 Mock smoke 已写入的非空 `state_file`。子 shell 成功返回只表示真实调用和恢复验证都通过；此时才把真实结果原子替换为后续复验使用的 `state_file`。失败或中断时，外层 EXIT trap 会随 `$run_tmp` 安全清理两份状态文件；同时也必须看到 retries 恢复验证完成，否则先人工恢复 `TENCENTCLOUD_OCR_MAX_RETRIES=2`、重新部署并用同一 SSH 断言确认，不能重跑付费 smoke。不要在重启持久性复验中重复运行真实 OCR；真实 Provider 的一次调用证据完成后，后续只读取该次已保存的上传和题目。
+
 不要退出当前 shell。保留这两个临时文件仅用于后续 API/Postgres 重启持久性与 Chrome 验收；不要打印密码或 Cookie。`state_file` 只允许包含 smoke 邮箱、上传 UUID 和题目 UUID。
 
 ### 6.1 逐服务重启与持久性复验
@@ -698,7 +828,7 @@ PY
     --dump-header "$image_headers" --output "$image_body" \
     --write-out '%{http_code}' "$WEB_URL/api/v1/uploads/$upload_id")
   test "$image_status" = 200
-  grep -Eqi '^content-type:[[:space:]]*image/(png|jpeg|webp)' "$image_headers"
+  grep -Eqi '^content-type:[[:space:]]*image/(png|jpeg|bmp)' "$image_headers"
   cmp -s "$smoke_image_path" "$image_body"
 
   rm -f -- "$values_file" "$cookie_jar" "$login_body" "$question_body" \

@@ -4,12 +4,13 @@ import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, FileText } from "lucide-react";
 import Link from "next/link";
+import Image from "next/image";
 
 import { AnalysisPanel } from "@/components/questions/analysis-panel";
 import { QuestionForm } from "@/components/questions/question-form";
 import { Button } from "@/components/ui/button";
-import { ApiError, apiFetch } from "@/lib/api";
-import type { Question, ReviewRecordPage } from "@/types/api";
+import { ApiError, apiFetch, apiUrl } from "@/lib/api";
+import type { Question, QuestionOcrMedia, ReviewRecordPage } from "@/types/api";
 
 interface QuestionDetailProps {
   id: string;
@@ -22,6 +23,135 @@ function detailError(error: unknown) {
 
 function displayText(value: string | null | undefined, fallback = "暂无内容") {
   return value?.trim() || fallback;
+}
+
+function protectedUploadUrl(assetId: string) {
+  return apiUrl(`/uploads/${encodeURIComponent(assetId)}`);
+}
+
+function OcrMediaGrid({
+  title,
+  items,
+  questionNumber,
+  kind,
+}: {
+  title: string;
+  items: QuestionOcrMedia[];
+  questionNumber: string;
+  kind: "图形" | "表格";
+}) {
+  const visible = items.filter((item) => item.asset || item.text?.trim());
+  if (!visible.length) return null;
+  return (
+    <section aria-label={title}>
+      <h3 className="text-sm font-semibold text-[#52627F]">{title}</h3>
+      <div className="mt-2 grid gap-3 sm:grid-cols-2">
+        {visible.map((item, index) => (
+          <figure key={`${kind}-${item.index ?? index}`} className="overflow-hidden rounded-lg border border-[#E4E8F2] bg-[#F7F8FC]">
+            {item.asset ? (
+              <Image
+                src={protectedUploadUrl(item.asset.asset_id)}
+                alt={`${questionNumber}${kind} ${index + 1}`}
+                width={960}
+                height={640}
+                unoptimized
+                className="max-h-64 w-full object-contain"
+              />
+            ) : <p className="px-3 py-5 text-sm text-[#6A7893]">该素材未生成裁剪图，请结合原始文件核对。</p>}
+            {item.text ? <figcaption className="border-t border-[#E4E8F2] bg-white px-3 py-2 text-xs leading-5 text-[#52627F]">{item.text}</figcaption> : null}
+          </figure>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function OcrVisualContext({ question }: { question: Question }) {
+  const metadata = question.ocr_metadata;
+  if (!metadata) return null;
+  const numberLabel = `第 ${metadata.question_number?.trim() || "当前"} 题`;
+  const optionAssets = metadata.options.filter((option) => option.asset);
+
+  return (
+    <section className="rounded-xl border border-[#E4E8F2] bg-white p-5 sm:p-6" aria-labelledby="ocr-visual-title">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 id="ocr-visual-title" className="text-base font-semibold text-[#0D1B4C]">OCR 原始视觉材料</h2>
+          <p className="mt-1 text-sm leading-6 text-[#6A7893]">以下内容保留识别来源，OCR 答案与解析未自动写入正式字段。</p>
+        </div>
+        <a
+          href={protectedUploadUrl(metadata.source.asset_id)}
+          target="_blank"
+          rel="noreferrer"
+          className="text-sm font-medium text-[#4F46E5] hover:text-[#4338CA]"
+        >
+          查看 OCR 原始文件
+        </a>
+      </div>
+
+      {metadata.warnings.length ? (
+        <ul className="mt-4 rounded-lg border border-[#F5D797] bg-[#FFF9E9] px-4 py-3 text-sm leading-6 text-[#7A5A12]" aria-label="OCR 核对提醒">
+          {metadata.warnings.map((warning) => <li key={warning}>{warning}</li>)}
+        </ul>
+      ) : null}
+
+      <div className="mt-5 space-y-5">
+        {metadata.crop ? (
+          <figure className="overflow-hidden rounded-lg border border-[#E4E8F2] bg-[#F7F8FC]">
+            <Image
+              src={protectedUploadUrl(metadata.crop.asset_id)}
+              alt={`${numberLabel}裁剪图`}
+              width={1200}
+              height={800}
+              unoptimized
+              className="max-h-96 w-full object-contain"
+            />
+            <figcaption className="border-t border-[#E4E8F2] bg-white px-3 py-2 text-xs text-[#6A7893]">识别时保存的整题裁剪图</figcaption>
+          </figure>
+        ) : null}
+
+        <OcrMediaGrid title="题内图形" items={metadata.figures} questionNumber={numberLabel} kind="图形" />
+        <OcrMediaGrid title="题内表格" items={metadata.tables} questionNumber={numberLabel} kind="表格" />
+
+        {optionAssets.length ? (
+          <section aria-label="选项图形">
+            <h3 className="text-sm font-semibold text-[#52627F]">选项图形</h3>
+            <div className="mt-2 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              {optionAssets.map((option) => (
+                <figure key={option.label} className="overflow-hidden rounded-lg border border-[#E4E8F2] bg-[#F7F8FC]">
+                  <Image
+                    src={protectedUploadUrl(option.asset!.asset_id)}
+                    alt={`${numberLabel}选项 ${option.label} 图形`}
+                    width={720}
+                    height={480}
+                    unoptimized
+                    className="max-h-48 w-full object-contain"
+                  />
+                  <figcaption className="border-t border-[#E4E8F2] bg-white px-3 py-2 text-xs font-semibold text-[#52627F]">选项 {option.label}</figcaption>
+                </figure>
+              ))}
+            </div>
+          </section>
+        ) : null}
+
+        <dl className="grid gap-4 sm:grid-cols-2">
+          <div className="rounded-lg border border-[#E4E8F2] bg-[#F7F8FC] p-4">
+            <dt className="text-xs font-semibold text-[#6A7893]">OCR 识别答案（未确认）</dt>
+            <dd className="mt-2 whitespace-pre-wrap text-sm text-[#0D1B4C]">{displayText(metadata.recognized_answer, "未识别到答案")}</dd>
+          </div>
+          <div className="rounded-lg border border-[#E4E8F2] bg-[#F7F8FC] p-4">
+            <dt className="text-xs font-semibold text-[#6A7893]">OCR 识别解析（未确认）</dt>
+            <dd className="mt-2 whitespace-pre-wrap text-sm leading-6 text-[#0D1B4C]">{displayText(metadata.recognized_parse, "未识别到解析")}</dd>
+          </div>
+        </dl>
+
+        <details className="rounded-lg border border-[#E4E8F2] px-4 py-3">
+          <summary className="cursor-pointer text-sm font-medium text-[#52627F]">查看保存的 OCR 完整原文</summary>
+          <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-[#314568]">{metadata.full_text}</p>
+        </details>
+      </div>
+    </section>
+  );
 }
 
 export function QuestionDetail({ id }: QuestionDetailProps) {
@@ -66,6 +196,8 @@ export function QuestionDetail({ id }: QuestionDetailProps) {
         <div className="rounded-xl border border-[#E4E8F2] bg-white p-5"><h2 id="detail-answer-title" className="text-base font-semibold text-[#0D1B4C]">答案</h2><dl className="mt-4 space-y-3 text-sm"><div><dt className="text-[#6A7893]">我的答案</dt><dd className="mt-1 font-medium text-[#D84755]">{question.user_answer}</dd></div><div><dt className="text-[#6A7893]">正确答案</dt><dd className="mt-1 font-medium text-[#079976]">{question.correct_answer}</dd></div></dl></div>
         <div className="rounded-xl border border-[#E4E8F2] bg-white p-5"><h2 className="text-base font-semibold text-[#0D1B4C]">原解析</h2><p className="mt-4 whitespace-pre-wrap text-sm leading-6 text-[#52627F]">{displayText(question.original_explanation)}</p></div>
       </section>
+
+      <OcrVisualContext question={question} />
 
       <AnalysisPanel question={question} />
 

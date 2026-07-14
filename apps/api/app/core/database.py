@@ -15,7 +15,9 @@ def normalize_database_url(database_url: str) -> str:
 
 
 def create_session_factory(database_url: str) -> async_sessionmaker[AsyncSession]:
-    engine = create_async_engine(normalize_database_url(database_url), pool_pre_ping=True)
+    engine = create_async_engine(
+        normalize_database_url(database_url), pool_pre_ping=True
+    )
     return async_sessionmaker(engine, expire_on_commit=False)
 
 

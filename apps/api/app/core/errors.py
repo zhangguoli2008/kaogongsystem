@@ -29,7 +29,7 @@ def request_id_for(request: Request) -> str:
     """Return one request ID shared by handlers, provider logs and responses."""
 
     existing = getattr(request.state, "request_id", None)
-    if existing:
+    if isinstance(existing, str) and existing:
         return existing
     resolved = request.headers.get("X-Request-ID") or str(uuid4())
     request.state.request_id = resolved

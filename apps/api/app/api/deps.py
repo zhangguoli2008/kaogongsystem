@@ -1,7 +1,7 @@
 import re
 import secrets
 from ipaddress import ip_address
-from typing import Annotated
+from typing import Annotated, cast
 
 import jwt
 from fastapi import Depends, Request
@@ -78,7 +78,7 @@ CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
 def get_ocr_service(request: Request) -> OCRService:
-    return request.app.state.ocr_service
+    return cast(OCRService, request.app.state.ocr_service)
 
 
 OCRServiceDep = Annotated[OCRService, Depends(get_ocr_service)]

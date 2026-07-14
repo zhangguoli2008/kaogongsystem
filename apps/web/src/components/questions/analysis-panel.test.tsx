@@ -27,6 +27,7 @@ const failedQuestion = {
   notes: null,
   image_path: null,
   ocr_raw_text: null,
+  ocr_metadata: null,
   knowledge_points: [],
   error_reason: null,
   mastery_status: "未掌握",

@@ -40,7 +40,9 @@ def columns(database_path: Path, table_name: str) -> set[str]:
 
 def version(database_path: Path) -> str:
     with sqlite3.connect(database_path) as connection:
-        return connection.execute("SELECT version_num FROM alembic_version").fetchone()[0]
+        return connection.execute("SELECT version_num FROM alembic_version").fetchone()[
+            0
+        ]
 
 
 def test_wrong_question_migration_supports_fresh_existing_and_downgrade(tmp_path):
@@ -58,6 +60,7 @@ def test_wrong_question_migration_supports_fresh_existing_and_downgrade(tmp_path
         "ocr_tasks",
     } <= schema(fresh)
     assert "analysis_error_code" in columns(fresh, "questions")
+    assert "ocr_metadata" in columns(fresh, "questions")
     assert {
         "id",
         "user_id",
@@ -86,6 +89,7 @@ def test_wrong_question_migration_supports_fresh_existing_and_downgrade(tmp_path
     run_alembic(existing, "upgrade", "0005_review_records")
     assert version(existing) == "0005_review_records"
     assert "ocr_tasks" not in schema(existing)
+    assert "ocr_metadata" not in columns(existing, "questions")
 
     run_alembic(existing, "upgrade", "head")
     run_alembic(existing, "check")
@@ -98,6 +102,7 @@ def test_wrong_question_migration_supports_fresh_existing_and_downgrade(tmp_path
         "ocr_tasks",
     } <= schema(existing)
     assert "analysis_error_code" in columns(existing, "questions")
+    assert "ocr_metadata" in columns(existing, "questions")
     assert {"result_status", "review_note", "reviewed_at"} <= columns(
         existing, "review_records"
     )
@@ -105,6 +110,7 @@ def test_wrong_question_migration_supports_fresh_existing_and_downgrade(tmp_path
     run_alembic(existing, "downgrade", "0005_review_records")
     assert version(existing) == "0005_review_records"
     assert "ocr_tasks" not in schema(existing)
+    assert "ocr_metadata" not in columns(existing, "questions")
     run_alembic(existing, "downgrade", "0004_analysis_error_code")
     assert version(existing) == "0004_analysis_error_code"
     assert "review_records" not in schema(existing)

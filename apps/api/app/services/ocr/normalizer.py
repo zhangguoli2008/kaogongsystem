@@ -232,7 +232,8 @@ def normalize_question_split_response(
     """Normalize one Tencent response without retaining its source image bytes."""
 
     questions: list[OcrQuestion] = []
-    for source_info_index, info in enumerate(raw_model.question_info or []):
+    question_info = raw_model.question_info or []
+    for source_info_index, info in enumerate(question_info):
         for raw_question in info.result_list or []:
             question = _normalize_question(
                 raw_question,
@@ -242,10 +243,10 @@ def normalize_question_split_response(
             if question is not None:
                 questions.append(question)
 
-    if not questions:
+    if not questions or not question_info:
         raise NoQuestionDetected("未识别到有效题目")
 
-    first_info = raw_model.question_info[0]
+    first_info = question_info[0]
     source = OcrSource(
         file_id=file_id,
         image_url=f"/uploads/{file_id}",

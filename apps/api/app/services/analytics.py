@@ -4,6 +4,8 @@ from datetime import datetime, time, timedelta, timezone
 
 from sqlalchemy import func, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import InstrumentedAttribute
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.config import Settings
 from app.models.question import Question
@@ -18,7 +20,7 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def _utc_date_bucket(session: AsyncSession):
+def _utc_date_bucket(session: AsyncSession) -> ColumnElement[object]:
     """Return the database date expression for the same UTC day as filters."""
 
     if session.get_bind().dialect.name == "postgresql":
@@ -29,7 +31,7 @@ def _utc_date_bucket(session: AsyncSession):
 async def _count_distribution(
     session: AsyncSession,
     user_id: str,
-    column,
+    column: InstrumentedAttribute[str] | InstrumentedAttribute[str | None],
     *,
     unfinished_only: bool = False,
 ) -> list[CountByLabel]:
@@ -43,7 +45,7 @@ async def _count_distribution(
         .group_by(column)
         .order_by(count.desc(), column.asc())
     )
-    return [CountByLabel(label=str(row.label), count=int(row.count)) for row in rows]
+    return [CountByLabel(label=str(label), count=int(total)) for label, total in rows]
 
 
 async def knowledge_point_ranking(
@@ -59,7 +61,7 @@ async def knowledge_point_ranking(
         .group_by(points.c.value)
         .order_by(count.desc(), points.c.value.asc())
     )
-    return [CountByLabel(label=str(row.label), count=int(row.count)) for row in rows]
+    return [CountByLabel(label=str(label), count=int(total)) for label, total in rows]
 
 
 async def trend_for_days(
@@ -71,7 +73,9 @@ async def trend_for_days(
     current = _as_utc(now or utc_now())
     start_date = current.date() - timedelta(days=days - 1)
     start = datetime.combine(start_date, time.min, tzinfo=timezone.utc)
-    end = datetime.combine(current.date() + timedelta(days=1), time.min, tzinfo=timezone.utc)
+    end = datetime.combine(
+        current.date() + timedelta(days=1), time.min, tzinfo=timezone.utc
+    )
     date_column = _utc_date_bucket(session)
     count = func.count().label("count")
     rows = await session.execute(
@@ -83,7 +87,7 @@ async def trend_for_days(
         )
         .group_by(date_column)
     )
-    counts = {str(row.date): int(row.count) for row in rows}
+    counts = {str(day): int(total) for day, total in rows}
     return [
         TrendPoint(
             date=(start_date + timedelta(days=index)).isoformat(),
@@ -140,6 +144,8 @@ async def get_analytics_summary(
 async def get_weak_modules(
     session: AsyncSession, user_id: str, limit: int = 3
 ) -> list[CountByLabel]:
-    return (await _count_distribution(
-        session, user_id, Question.module, unfinished_only=True
-    ))[:limit]
+    return (
+        await _count_distribution(
+            session, user_id, Question.module, unfinished_only=True
+        )
+    )[:limit]

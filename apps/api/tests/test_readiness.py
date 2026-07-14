@@ -55,9 +55,7 @@ def test_explicit_allowed_hosts_rejects_unknown_host_with_cors(test_settings) ->
             "/health",
             headers={"Host": "evil.example", "Origin": allowed_origin},
         )
-        accepted = client.get(
-            "/health", headers={"Host": "healthcheck.railway.app"}
-        )
+        accepted = client.get("/health", headers={"Host": "healthcheck.railway.app"})
 
     assert rejected.status_code == 400
     assert rejected.headers.get("Access-Control-Allow-Origin") == allowed_origin

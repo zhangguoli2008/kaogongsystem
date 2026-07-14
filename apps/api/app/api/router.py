@@ -16,9 +16,7 @@ api_router = APIRouter(prefix="/api/v1")
 
 
 @api_router.get("/ocr/status", tags=["ocr"], response_model=OcrStatus)
-async def ocr_status(
-    request: Request, current_user: CurrentUser
-) -> OcrStatus:
+async def ocr_status(request: Request, current_user: CurrentUser) -> OcrStatus:
     del current_user
     settings = request.app.state.settings
     configured = settings.ocr_provider == "mock" or bool(

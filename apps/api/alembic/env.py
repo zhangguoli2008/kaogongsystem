@@ -1,8 +1,11 @@
 import asyncio
+import json
 import os
 from logging.config import fileConfig
+import re
 
 from alembic import context
+import sqlalchemy as sa
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
@@ -27,11 +30,46 @@ config.set_main_option(
 target_metadata = Base.metadata
 
 
+def _json_default_value(rendered: str) -> object:
+    """Parse a PostgreSQL/SQLAlchemy JSON literal for semantic comparison."""
+
+    value = rendered.strip()
+    value = re.sub(r"::jsonb?\s*$", "", value, flags=re.IGNORECASE).strip()
+    while value.startswith("(") and value.endswith(")"):
+        value = value[1:-1].strip()
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        value = value[1:-1].replace("''", "'")
+    return json.loads(value)
+
+
+def _compare_server_default(
+    migration_context,
+    inspected_column,
+    metadata_column,
+    inspected_default,
+    metadata_default,
+    rendered_metadata_default,
+):
+    """Avoid PostgreSQL's unsupported ``json = json`` default comparison."""
+
+    del migration_context, inspected_column, metadata_default
+    if not isinstance(metadata_column.type, sa.JSON):
+        return None
+    if inspected_default is None or rendered_metadata_default is None:
+        return inspected_default != rendered_metadata_default
+    try:
+        return _json_default_value(inspected_default) != _json_default_value(
+            rendered_metadata_default
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def do_run_migrations(connection) -> None:
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
-        compare_server_default=True,
+        compare_server_default=_compare_server_default,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -54,7 +92,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
-        compare_server_default=True,
+        compare_server_default=_compare_server_default,
     )
     with context.begin_transaction():
         context.run_migrations()

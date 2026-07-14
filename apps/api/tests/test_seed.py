@@ -76,7 +76,9 @@ def test_seed_is_idempotent_and_covers_the_demo_diagnosis_flow(
                     "计算错",
                     "时间不够",
                 }
-                assert all(question.analysis_status == "已完成" for question in questions)
+                assert all(
+                    question.analysis_status == "已完成" for question in questions
+                )
                 assert all(question.current_analysis_id for question in questions)
 
                 analyses = list(
@@ -97,7 +99,9 @@ def test_seed_is_idempotent_and_covers_the_demo_diagnosis_flow(
                     "users": await session.scalar(select(func.count(User.id))),
                     "questions": await session.scalar(select(func.count(Question.id))),
                     "analyses": await session.scalar(select(func.count(Analysis.id))),
-                    "reviews": await session.scalar(select(func.count(ReviewRecord.id))),
+                    "reviews": await session.scalar(
+                        select(func.count(ReviewRecord.id))
+                    ),
                 }
 
             async with session_factory() as session:
@@ -121,7 +125,9 @@ def test_seed_is_idempotent_and_covers_the_demo_diagnosis_flow(
                     "users": await session.scalar(select(func.count(User.id))),
                     "questions": await session.scalar(select(func.count(Question.id))),
                     "analyses": await session.scalar(select(func.count(Analysis.id))),
-                    "reviews": await session.scalar(select(func.count(ReviewRecord.id))),
+                    "reviews": await session.scalar(
+                        select(func.count(ReviewRecord.id))
+                    ),
                 }
                 assert counts_after == counts_before
         finally:

@@ -77,6 +77,9 @@ validate_origin API_URL "$API_URL"
 web_url=$WEB_URL
 api_url=$API_URL
 api_proxy="$web_url/api/v1"
+if [[ ${EXPECTED_OCR_PROVIDER:-mock} == "tencent_question_split" && -z ${SMOKE_IMAGE_PATH:-} ]]; then
+  die "SMOKE_IMAGE_PATH is required when EXPECTED_OCR_PROVIDER=tencent_question_split"
+fi
 image_path=${SMOKE_IMAGE_PATH:-docs/design/ai-exam-diagnosis-dashboard-selected.png}
 
 [[ -f "$image_path" && ! -L "$image_path" && -r "$image_path" ]] \
@@ -99,18 +102,23 @@ import sys
 
 path = sys.argv[1]
 size = os.path.getsize(path)
-if not 0 < size <= 10 * 1024 * 1024:
-    raise SystemExit("SMOKE_IMAGE_PATH must be between 1 byte and 10 MiB")
+if size <= 0:
+    raise SystemExit("SMOKE_IMAGE_PATH must not be empty")
+if 4 * ((size + 2) // 3) > 10 * 1024 * 1024:
+    raise SystemExit(
+        "SMOKE_IMAGE_PATH Base64 payload exceeds 10 MiB "
+        "(raw file maximum is 7.5 MiB)"
+    )
 with open(path, "rb") as source:
     header = source.read(16)
 if header.startswith(b"\x89PNG\r\n\x1a\n"):
     print("image/png")
 elif header.startswith(b"\xff\xd8\xff"):
     print("image/jpeg")
-elif header[:4] == b"RIFF" and header[8:12] == b"WEBP":
-    print("image/webp")
+elif header.startswith(b"BM"):
+    print("image/bmp")
 else:
-    raise SystemExit("SMOKE_IMAGE_PATH must be a PNG, JPEG, or WebP image")
+    raise SystemExit("SMOKE_IMAGE_PATH must be a PNG, JPEG, or BMP image")
 PY
 )
 
@@ -327,7 +335,7 @@ python3 - "$oversize_file" <<'PY'
 import sys
 
 with open(sys.argv[1], "wb") as target:
-    target.truncate(10 * 1024 * 1024 + 1)
+    target.truncate((10 * 1024 * 1024 // 4) * 3 + 1)
 PY
 
 curl_common=(
@@ -620,18 +628,41 @@ if (
     raise SystemExit("proxy redirect escaped the public Web API origin")
 PY
 
-http_request 415 "$tmp_dir/wrong-mime.json" "$tmp_dir/wrong-mime.headers" \
+http_request 200 "$tmp_dir/ocr-status.json" "$tmp_dir/ocr-status.headers" \
+  --cookie "$cookie_jar" "$api_proxy/ocr/status"
+python3 - "$tmp_dir/ocr-status.json" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    payload = json.load(source)
+expected_provider = os.environ.get("EXPECTED_OCR_PROVIDER", "mock")
+expected = {
+    "provider": expected_provider,
+    "configured": True,
+    "api_name": "QuestionSplitOCR",
+    "supports_multi_question": True,
+    "supports_pdf": True,
+    "supports_options": True,
+    "use_new_model": False,
+}
+if payload != expected:
+    raise SystemExit("OCR status contract mismatch")
+PY
+
+http_request 422 "$tmp_dir/wrong-mime.json" "$tmp_dir/wrong-mime.headers" \
   --cookie "$cookie_jar" \
   --form "file=@$wrong_file;type=text/plain" \
   "$api_proxy/uploads/questions"
 assert_api_error \
-  "$tmp_dir/wrong-mime.json" "$tmp_dir/wrong-mime.headers" unsupported_image_type
+  "$tmp_dir/wrong-mime.json" "$tmp_dir/wrong-mime.headers" OCR_UNSUPPORTED_FILE_TYPE
 http_request 413 "$tmp_dir/oversize.json" "$tmp_dir/oversize.headers" \
   --cookie "$cookie_jar" \
   --form "file=@$oversize_file;type=image/png" \
   "$api_proxy/uploads/questions"
 assert_api_error \
-  "$tmp_dir/oversize.json" "$tmp_dir/oversize.headers" upload_too_large
+  "$tmp_dir/oversize.json" "$tmp_dir/oversize.headers" OCR_FILE_TOO_LARGE
 
 http_request 201 "$tmp_dir/upload.json" "$tmp_dir/upload.headers" \
   --cookie "$cookie_jar" \
@@ -651,35 +682,99 @@ http_request 200 "$tmp_dir/ocr.json" "$tmp_dir/ocr.headers" \
   "$api_proxy/ocr"
 python3 - "$tmp_dir/ocr.json" <<'PY'
 import json
+import os
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as source:
     payload = json.load(source)
-if payload.get("is_demo") is not True:
-    raise SystemExit("OCR did not use the demo provider")
-for key in ("stem", "options", "correct_answer", "original_explanation", "raw_text"):
-    if not payload.get(key):
+expected_provider = os.environ.get("EXPECTED_OCR_PROVIDER", "mock")
+if payload.get("provider") != expected_provider:
+    raise SystemExit("OCR provider mismatch")
+if payload.get("api_name") != "QuestionSplitOCR":
+    raise SystemExit("OCR API contract mismatch")
+if payload.get("is_demo") is not (expected_provider == "mock"):
+    raise SystemExit("OCR demo marker mismatch")
+if payload.get("question_count") != len(payload.get("questions", [])):
+    raise SystemExit("OCR question count mismatch")
+if not payload.get("questions"):
+    raise SystemExit("OCR returned no questions")
+if payload.get("source", {}).get("file_id") is None:
+    raise SystemExit("OCR source identity is missing")
+for key in ("temporary_id", "question_text", "full_text", "question_type"):
+    if not payload["questions"][0].get(key):
         raise SystemExit(f"OCR field is empty: {key}")
+serialized = json.dumps(payload).casefold()
+for forbidden in ("imagebase64", "secretid", "secretkey", "storage_name"):
+    if forbidden in serialized:
+        raise SystemExit(f"OCR response leaked forbidden field: {forbidden}")
 PY
 
-python3 - "$tmp_dir/ocr.json" "$tmp_dir/question.json" "$upload_id" <<'PY'
+python3 - "$tmp_dir/ocr.json" "$tmp_dir/question.json" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as source:
     ocr = json.load(source)
+question = ocr["questions"][0]
+
+def asset(asset_id):
+    return {"asset_id": asset_id} if asset_id else None
+
+ocr_metadata = {
+    "source": asset(ocr["source"]["file_id"]),
+    "question_number": question.get("question_number"),
+    "question_type": question["question_type"],
+    "full_text": question["full_text"],
+    "question_elements": question.get("question_elements", []),
+    "coord": question.get("coord", []),
+    "crop": asset(question.get("crop_asset_id")),
+    "figures": [
+        {
+            "index": item.get("index"),
+            "text": item.get("text"),
+            "coord": item.get("coord"),
+            "asset": asset(item.get("asset_id")),
+        }
+        for item in question.get("figures", [])
+    ],
+    "tables": [
+        {
+            "index": item.get("index"),
+            "text": item.get("text"),
+            "coord": item.get("coord"),
+            "asset": asset(item.get("asset_id")),
+        }
+        for item in question.get("tables", [])
+    ],
+    "options": [
+        {
+            "label": item["label"],
+            "coord": item.get("coord"),
+            "asset": asset(item.get("asset_id")),
+        }
+        for item in question.get("options", [])
+    ],
+    "recognized_answer": question.get("recognized_answer"),
+    "recognized_parse": question.get("recognized_parse"),
+    "warnings": list(dict.fromkeys([*ocr.get("warnings", []), *question.get("warnings", [])])),
+}
 payload = {
     "exam_type": "国考",
     "module": "言语理解",
-    "stem": ocr["stem"] + "（Railway production smoke）",
-    "options": ocr["options"],
-    "user_answer": ocr["user_answer"] or "A",
-    "correct_answer": ocr["correct_answer"],
-    "original_explanation": ocr["original_explanation"],
+    "stem": question["question_text"] + "（Railway production smoke）",
+    "options": [
+        {"label": item["label"], "content": item["text"]}
+        for item in question.get("options", [])
+        if item.get("label") and item.get("text")
+    ],
+    "user_answer": "SMOKE-USER",
+    "correct_answer": "SMOKE-CONFIRMED",
+    "original_explanation": None,
     "source": "Railway production smoke",
     "notes": "正式环境自动化验收",
-    "image_path": f"/uploads/{sys.argv[3]}",
-    "ocr_raw_text": ocr["raw_text"],
+    "image_path": ocr["source"]["image_url"],
+    "ocr_raw_text": question["full_text"],
+    "ocr_metadata": ocr_metadata,
     "knowledge_points": [],
     "mastery_status": "未掌握",
     "analysis_status": "未分析",

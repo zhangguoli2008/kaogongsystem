@@ -441,7 +441,9 @@ def test_existing_domain_errors_are_rebuilt_from_safe_allowlist(
     assert mapped is not original
     assert (mapped.status_code, mapped.code, mapped.message, mapped.retryable) == (
         status_code,
-        incoming_code if incoming_code != "UNTRUSTED_DOMAIN_CODE" else "OCR_PROVIDER_ERROR",
+        incoming_code
+        if incoming_code != "UNTRUSTED_DOMAIN_CODE"
+        else "OCR_PROVIDER_ERROR",
         message,
         retryable,
     )
@@ -501,7 +503,7 @@ async def test_transient_sdk_errors_stop_after_three_total_attempts(
 
 
 @pytest.mark.anyio
-async def test_retry_configuration_is_capped_at_two_retries(
+async def test_provider_defensively_caps_unvalidated_retry_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tencent, errors = _provider_modules()
@@ -523,7 +525,7 @@ async def test_retry_configuration_is_capped_at_two_retries(
 
     monkeypatch.setattr(ocr_client, "OcrClient", FakeClient)
     provider = tencent.TencentOCRProvider(
-        _settings(tencentcloud_ocr_max_retries=99),
+        _settings().model_copy(update={"tencentcloud_ocr_max_retries": 99}),
         sleep=no_wait,
         jitter=lambda: 0.0,
     )
@@ -621,7 +623,9 @@ async def test_mock_provider_is_deterministic_multi_question_official_shape() ->
     provider = mock_module.MockOCRProvider()
 
     first = await provider.recognize_questions(b"ignored", "sample.png", "image/png")
-    second = await provider.recognize_questions(b"different", "other.pdf", "application/pdf")
+    second = await provider.recognize_questions(
+        b"different", "other.pdf", "application/pdf"
+    )
 
     assert isinstance(first, types_module.Response)
     assert provider.name == "mock"
@@ -629,18 +633,47 @@ async def test_mock_provider_is_deterministic_multi_question_official_shape() ->
     assert first.request_id.startswith("mock-")
     assert first.model_dump(by_alias=True) == second.model_dump(by_alias=True)
     groups = [
-        group
-        for info in first.question_info or []
-        for group in info.result_list or []
+        group for info in first.question_info or [] for group in info.result_list or []
     ]
-    assert len(groups) >= 2
+    assert len(groups) == 4
     assert any(group.question for group in groups)
     assert any(group.figure for group in groups)
     assert any(group.table for group in groups)
-    assert [
-        [question.group_type for question in group.question or []]
+    assert all(group.coord for group in groups)
+    assert all(group.answer and group.parse for group in groups)
+    assert all(
+        element.coord is not None
         for group in groups
-    ] == [["multiple-choice"], ["problem-solving"]]
+        for element in [
+            *(group.question or []),
+            *(group.option or []),
+            *(group.figure or []),
+            *(group.table or []),
+        ]
+    )
+    assert [
+        [question.group_type for question in group.question or []] for group in groups
+    ] == [
+        ["multiple-choice"],
+        ["arithmetic"],
+        ["multiple-choice"],
+        ["problem-solving"],
+    ]
+
+    page_two = await provider.recognize_questions(
+        b"ignored", "paper.pdf", "application/pdf", pdf_page_number=2
+    )
+    repeated_page_two = await provider.recognize_questions(
+        b"different", "another.pdf", "application/pdf", pdf_page_number=2
+    )
+    assert page_two.model_dump(by_alias=True) == repeated_page_two.model_dump(
+        by_alias=True
+    )
+    assert page_two.model_dump(by_alias=True) != first.model_dump(by_alias=True)
+    assert page_two.request_id == "mock-question-split-page-2"
+    assert "第 2 页" in (
+        page_two.question_info[0].result_list[0].question[0].text or ""
+    )
 
 
 def test_factory_centralizes_mock_and_tencent_selection() -> None:

@@ -31,6 +31,103 @@ export interface QuestionOption {
   content: string;
 }
 
+export interface OcrPoint {
+  x: number;
+  y: number;
+}
+
+export interface OcrPolygon {
+  left_top: OcrPoint | null;
+  right_top: OcrPoint | null;
+  right_bottom: OcrPoint | null;
+  left_bottom: OcrPoint | null;
+}
+
+export type OcrQuestionType =
+  | "multiple_choice_unknown"
+  | "fill_blank"
+  | "problem_solving"
+  | "arithmetic"
+  | "unknown";
+
+export interface OcrTextElement {
+  index: number | null;
+  text: string | null;
+  coord: OcrPolygon | null;
+}
+
+export interface OcrOption {
+  label: string;
+  text: string;
+  raw_text: string;
+  coord: OcrPolygon | null;
+  asset_id: string | null;
+  image_url: string | null;
+}
+
+export interface OcrMedia {
+  index: number | null;
+  text: string | null;
+  coord: OcrPolygon | null;
+  asset_id: string | null;
+  image_url: string | null;
+}
+
+export interface OcrQuestion {
+  temporary_id: string;
+  index: number | null;
+  source_info_index: number;
+  question_number: string | null;
+  question_type: OcrQuestionType;
+  question_text: string;
+  full_text: string;
+  question_elements: OcrTextElement[];
+  options: OcrOption[];
+  figures: OcrMedia[];
+  tables: OcrMedia[];
+  recognized_answer: string | null;
+  recognized_parse: string | null;
+  coord: OcrPolygon[];
+  raw_group_type: string | null;
+  warnings: string[];
+  crop_asset_id: string | null;
+  crop_image_url: string | null;
+}
+
+export interface QuestionOcrAsset {
+  asset_id: string;
+  image_url?: string | null;
+}
+
+export interface QuestionOcrMedia {
+  index: number | null;
+  text: string | null;
+  coord: OcrPolygon | null;
+  asset: QuestionOcrAsset | null;
+}
+
+export interface QuestionOcrOptionMedia {
+  label: string;
+  coord: OcrPolygon | null;
+  asset: QuestionOcrAsset | null;
+}
+
+export interface QuestionOcrMetadata {
+  source: QuestionOcrAsset;
+  question_number: string | null;
+  question_type: OcrQuestionType;
+  full_text: string;
+  question_elements: OcrTextElement[];
+  coord: OcrPolygon[];
+  crop: QuestionOcrAsset | null;
+  figures: QuestionOcrMedia[];
+  tables: QuestionOcrMedia[];
+  options: QuestionOcrOptionMedia[];
+  recognized_answer: string | null;
+  recognized_parse: string | null;
+  warnings: string[];
+}
+
 export interface Analysis {
   id: string;
   question_id: string;
@@ -59,6 +156,7 @@ export interface QuestionInput {
   notes?: string | null;
   image_path?: string | null;
   ocr_raw_text?: string | null;
+  ocr_metadata?: QuestionOcrMetadata | null;
   knowledge_points: string[];
   error_reason?: ErrorReason | null;
   mastery_status: MasteryStatus;
@@ -74,6 +172,7 @@ export interface Question extends Omit<
   | "notes"
   | "image_path"
   | "ocr_raw_text"
+  | "ocr_metadata"
   | "error_reason"
   | "tags"
 > {
@@ -84,6 +183,7 @@ export interface Question extends Omit<
   notes: string | null;
   image_path: string | null;
   ocr_raw_text: string | null;
+  ocr_metadata: QuestionOcrMetadata | null;
   error_reason: ErrorReason | null;
   tags: string[];
   analysis_status: AnalysisStatus;
@@ -108,16 +208,41 @@ export interface Upload {
   mime_type: string;
   size_bytes: number;
   created_at: string;
+  file_kind: "image" | "pdf";
+  width: number | null;
+  height: number | null;
+  page_count: number | null;
+  warnings: string[];
 }
 
 export interface OcrResult {
-  stem: string;
-  options: QuestionOption[];
-  user_answer: string;
-  correct_answer: string;
-  original_explanation: string;
-  raw_text: string;
+  provider: string;
+  api_name: "QuestionSplitOCR";
+  request_id: string;
+  page_number: number;
+  question_count: number;
+  source: {
+    file_id: string;
+    image_url: string;
+    original_width: number | null;
+    original_height: number | null;
+    processed_width: number | null;
+    processed_height: number | null;
+    angle: number | null;
+  };
+  warnings: string[];
+  questions: OcrQuestion[];
   is_demo: boolean;
+}
+
+export interface OcrStatus {
+  provider: "mock" | "tencent_question_split";
+  configured: boolean;
+  api_name: "QuestionSplitOCR";
+  supports_multi_question: true;
+  supports_pdf: true;
+  supports_options: true;
+  use_new_model: false;
 }
 
 export interface BulkResult {

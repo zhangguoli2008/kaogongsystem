@@ -280,9 +280,7 @@ def test_question_review_history_hides_another_users_question(client):
     submit_review(client, owner, question["id"])
     other = register(client, "review-history-other@example.com")
 
-    response = client.get(
-        f"/api/v1/reviews/questions/{question['id']}", cookies=other
-    )
+    response = client.get(f"/api/v1/reviews/questions/{question['id']}", cookies=other)
 
     assert response.status_code == 404
     assert response.json()["code"] == "not_found"

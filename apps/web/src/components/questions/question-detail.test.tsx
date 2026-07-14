@@ -31,6 +31,7 @@ const question = {
   notes: "先确定基期。",
   image_path: null,
   ocr_raw_text: null,
+  ocr_metadata: null,
   knowledge_points: ["增长率"],
   error_reason: "计算错",
   mastery_status: "复习中",
@@ -130,5 +131,79 @@ describe("QuestionDetail", () => {
 
     expect(await screen.findByText("第二页记录")).toBeVisible();
     expect(apiFetchMock).toHaveBeenCalledWith("/reviews/questions/q1?page=2&page_size=10");
+  });
+
+  it("renders persisted OCR visual context from protected API URLs and keeps recognized text unconfirmed", async () => {
+    const user = userEvent.setup();
+    const visualQuestion = {
+      ...question,
+      ocr_metadata: {
+        source: { asset_id: "source-asset", image_url: "/uploads/source-asset" },
+        question_number: "8",
+        question_type: "multiple_choice_unknown",
+        full_text: "8. 带图表的题目",
+        question_elements: [],
+        coord: [],
+        crop: { asset_id: "crop-asset", image_url: "/uploads/crop-asset" },
+        figures: [
+          { index: 0, text: "几何图形", coord: null, asset: { asset_id: "figure-asset", image_url: "/uploads/figure-asset" } },
+          { index: 1, text: "仅保留的图形文字", coord: null, asset: null },
+        ],
+        tables: [{ index: 0, text: "统计表格", coord: null, asset: { asset_id: "table-asset", image_url: "/uploads/table-asset" } }],
+        options: [{ label: "A", coord: null, asset: { asset_id: "option-asset", image_url: "/uploads/option-asset" } }],
+        recognized_answer: "C",
+        recognized_parse: "OCR 图片中的原解析",
+        warnings: ["请人工核对图表数字"],
+      },
+    };
+    apiFetchMock.mockImplementation(async (path) => {
+      if (path === "/questions/q1") return visualQuestion;
+      if (path === "/reviews/questions/q1?page=1&page_size=10") return { items: [], page: 1, page_size: 10, total: 0 };
+      if (path === "/questions/q1/analyze") {
+        return {
+          id: "analysis-1",
+          question_id: "q1",
+          user_id: "u1",
+          cause_analysis: "未结合图表核对条件",
+          knowledge_points: ["增长率"],
+          correct_approach: "先读取图表再计算",
+          study_advice: "复盘图表题",
+          suggested_error_reason: "理解错",
+          raw_response: {},
+          provider_name: "demo",
+          model_name: null,
+          is_demo: true,
+          created_at: "2026-07-10T09:00:00Z",
+        };
+      }
+      throw new Error(`unexpected path: ${path}`);
+    });
+
+    renderWithProviders(<QuestionDetail id="q1" />);
+
+    expect(await screen.findByRole("heading", { name: "OCR 原始视觉材料" })).toBeVisible();
+    expect(screen.getByRole("link", { name: "查看 OCR 原始文件" })).toHaveAttribute(
+      "href",
+      "http://localhost:8000/api/v1/uploads/source-asset",
+    );
+    expect(screen.getByAltText("第 8 题裁剪图")).toHaveAttribute(
+      "src",
+      "http://localhost:8000/api/v1/uploads/crop-asset",
+    );
+    expect(screen.getByAltText("第 8 题图形 1")).toHaveAttribute(
+      "src",
+      "http://localhost:8000/api/v1/uploads/figure-asset",
+    );
+    expect(screen.getByAltText("第 8 题表格 1")).toBeVisible();
+    expect(screen.getByAltText("第 8 题选项 A 图形")).toBeVisible();
+    expect(screen.getByText("仅保留的图形文字")).toBeVisible();
+    expect(screen.getByText("请人工核对图表数字")).toBeVisible();
+    expect(screen.getByText("OCR 图片中的原解析")).toBeVisible();
+    expect(screen.getByText("C", { selector: "dd" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "开始分析" }));
+    await waitFor(() => {
+      expect(apiFetchMock).toHaveBeenCalledWith("/questions/q1/analyze", { method: "POST" });
+    });
+    expect(await screen.findByText("未结合图表核对条件")).toBeVisible();
   });
 });

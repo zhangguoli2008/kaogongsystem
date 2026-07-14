@@ -103,6 +103,7 @@ class TencentOCRProvider:
         pdf_page_number: int = 1,
     ) -> Response:
         del filename
+        client_error: OCRProviderError | None
         try:
             client = self._get_client()
         except Exception as exc:

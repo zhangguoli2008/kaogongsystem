@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import base64
-from collections.abc import Sequence
 import logging
+from collections.abc import Sequence
 from typing import Any
 
 from openai import (
@@ -11,6 +11,11 @@ from openai import (
     APITimeoutError,
     AsyncOpenAI,
     RateLimitError,
+)
+from openai.types.responses import (
+    ResponseInputContentParam,
+    ResponseInputParam,
+    ResponseTextConfigParam,
 )
 
 from app.core.errors import APIError
@@ -72,27 +77,33 @@ class OpenAIProvider:
         encoded = base64.b64encode(image_bytes).decode()
         data_url = f"data:{mime_type};base64,{encoded}"
         local_request_id = request_id or self.request_id
+        input_payload: ResponseInputParam = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "识别这一道公考题并按结构返回。"},
+                    {
+                        "type": "input_image",
+                        "image_url": data_url,
+                        "detail": "auto",
+                    },
+                ],
+            }
+        ]
+        text_config: ResponseTextConfigParam = {
+            "format": {
+                "type": "json_schema",
+                "name": "ocr_result",
+                "strict": True,
+                "schema": OcrResult.model_json_schema(),
+            }
+        }
         try:
             response = await self.client.responses.create(
                 model=self.model,
                 instructions=OCR_INSTRUCTIONS,
-                input=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": "识别这一道公考题并按结构返回。"},
-                            {"type": "input_image", "image_url": data_url},
-                        ],
-                    }
-                ],
-                text={
-                    "format": {
-                        "type": "json_schema",
-                        "name": "ocr_result",
-                        "strict": True,
-                        "schema": OcrResult.model_json_schema(),
-                    }
-                },
+                input=input_payload,
+                text=text_config,
             )
         except APITimeoutError as exc:
             self._log_provider_error(exc, "timeout", local_request_id=local_request_id)
@@ -101,12 +112,16 @@ class OpenAIProvider:
             self._log_provider_error(
                 exc, "connection", local_request_id=local_request_id
             )
-            raise APIError(502, "provider_connection_error", "OCR 服务连接失败") from exc
+            raise APIError(
+                502, "provider_connection_error", "OCR 服务连接失败"
+            ) from exc
         except RateLimitError as exc:
             self._log_provider_error(
                 exc, "rate_limit", local_request_id=local_request_id
             )
-            raise APIError(429, "provider_rate_limited", "OCR 服务请求过于频繁") from exc
+            raise APIError(
+                429, "provider_rate_limited", "OCR 服务请求过于频繁"
+            ) from exc
         except APIStatusError as exc:
             self._log_provider_error(
                 exc,
@@ -116,7 +131,9 @@ class OpenAIProvider:
             )
             status = getattr(exc.response, "status_code", 502)
             code = "provider_rate_limited" if status == 429 else "provider_api_error"
-            raise APIError(429 if status == 429 else 502, code, "OCR 服务暂时不可用") from exc
+            raise APIError(
+                429 if status == 429 else 502, code, "OCR 服务暂时不可用"
+            ) from exc
         except Exception as exc:
             # Do not leak SDK or response details through the API boundary.
             self._log_provider_error(
@@ -133,7 +150,9 @@ class OpenAIProvider:
                 status_code=getattr(response, "status_code", 200),
                 local_request_id=local_request_id,
             )
-            raise APIError(502, "provider_invalid_response", "OCR 服务返回内容无效") from exc
+            raise APIError(
+                502, "provider_invalid_response", "OCR 服务返回内容无效"
+            ) from exc
         return result.model_copy(update={"is_demo": False})
 
     def _log_provider_error(
@@ -181,7 +200,7 @@ class OpenAIProvider:
         images: Sequence[AnalysisImage] = (),
     ) -> AnalysisResult:
         local_request_id = request_id or self.request_id
-        content: list[dict[str, str]] = [
+        content: list[ResponseInputContentParam] = [
             {
                 "type": "input_text",
                 "text": payload.model_dump_json(),
@@ -193,26 +212,29 @@ class OpenAIProvider:
                 {
                     "type": "input_image",
                     "image_url": f"data:{image.mime_type};base64,{encoded}",
+                    "detail": "auto",
                 }
             )
+        input_payload: ResponseInputParam = [
+            {
+                "role": "user",
+                "content": content,
+            }
+        ]
+        text_config: ResponseTextConfigParam = {
+            "format": {
+                "type": "json_schema",
+                "name": "analysis_result",
+                "strict": True,
+                "schema": AnalysisProviderResponse.model_json_schema(),
+            }
+        }
         try:
             response = await self.client.responses.create(
                 model=self.model,
                 instructions=ANALYSIS_INSTRUCTIONS,
-                input=[
-                    {
-                        "role": "user",
-                        "content": content,
-                    }
-                ],
-                text={
-                    "format": {
-                        "type": "json_schema",
-                        "name": "analysis_result",
-                        "strict": True,
-                        "schema": AnalysisProviderResponse.model_json_schema(),
-                    }
-                },
+                input=input_payload,
+                text=text_config,
             )
         except APITimeoutError as exc:
             self._log_provider_error(exc, "timeout", local_request_id=local_request_id)
@@ -221,12 +243,16 @@ class OpenAIProvider:
             self._log_provider_error(
                 exc, "connection", local_request_id=local_request_id
             )
-            raise APIError(502, "provider_connection_error", "AI 分析服务连接失败") from exc
+            raise APIError(
+                502, "provider_connection_error", "AI 分析服务连接失败"
+            ) from exc
         except RateLimitError as exc:
             self._log_provider_error(
                 exc, "rate_limit", local_request_id=local_request_id
             )
-            raise APIError(429, "provider_rate_limited", "AI 分析服务请求过于频繁") from exc
+            raise APIError(
+                429, "provider_rate_limited", "AI 分析服务请求过于频繁"
+            ) from exc
         except APIStatusError as exc:
             self._log_provider_error(
                 exc,
@@ -237,9 +263,7 @@ class OpenAIProvider:
             status = getattr(exc.response, "status_code", 502)
             code = "provider_rate_limited" if status == 429 else "provider_api_error"
             message = (
-                "AI 分析服务请求过于频繁"
-                if status == 429
-                else "AI 分析服务暂时不可用"
+                "AI 分析服务请求过于频繁" if status == 429 else "AI 分析服务暂时不可用"
             )
             raise APIError(429 if status == 429 else 502, code, message) from exc
         except Exception as exc:
@@ -304,12 +328,16 @@ class OpenAIProvider:
             self._log_provider_error(
                 exc, "connection", local_request_id=local_request_id
             )
-            raise APIError(502, "provider_connection_error", "AI 建议服务连接失败") from exc
+            raise APIError(
+                502, "provider_connection_error", "AI 建议服务连接失败"
+            ) from exc
         except RateLimitError as exc:
             self._log_provider_error(
                 exc, "rate_limit", local_request_id=local_request_id
             )
-            raise APIError(429, "provider_rate_limited", "AI 建议服务请求过于频繁") from exc
+            raise APIError(
+                429, "provider_rate_limited", "AI 建议服务请求过于频繁"
+            ) from exc
         except APIStatusError as exc:
             self._log_provider_error(
                 exc,
@@ -320,9 +348,7 @@ class OpenAIProvider:
             status = getattr(exc.response, "status_code", 502)
             code = "provider_rate_limited" if status == 429 else "provider_api_error"
             message = (
-                "AI 建议服务请求过于频繁"
-                if status == 429
-                else "AI 建议服务暂时不可用"
+                "AI 建议服务请求过于频繁" if status == 429 else "AI 建议服务暂时不可用"
             )
             raise APIError(429 if status == 429 else 502, code, message) from exc
         except Exception as exc:

@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, type UseQueryResult } from "@tanstack/react-query";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -6,19 +6,28 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import AppLayout from "./layout";
 import { ApiError } from "@/lib/api";
 import { renderWithProviders } from "@/test/test-utils";
+import type { User } from "@/types/api";
 
-const { sessionState, mockReplaceDocument, fetchMock } = vi.hoisted(() => ({
-  sessionState: {
+type SessionSnapshot = Pick<
+  UseQueryResult<User>,
+  "data" | "error" | "isError" | "isPending"
+>;
+
+const { sessionState, mockReplaceDocument, fetchMock } = vi.hoisted(() => {
+  const sessionState: { current: SessionSnapshot } = {
     current: {
       data: { id: "u1", email: "learner@example.com" },
       error: null,
       isError: false,
       isPending: false,
     },
-  },
-  mockReplaceDocument: vi.fn(),
-  fetchMock: vi.fn(),
-}));
+  };
+  return {
+    sessionState,
+    mockReplaceDocument: vi.fn(),
+    fetchMock: vi.fn(),
+  };
+});
 
 vi.mock("next/navigation", () => ({
   usePathname: () => "/dashboard",

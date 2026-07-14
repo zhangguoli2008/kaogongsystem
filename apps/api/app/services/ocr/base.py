@@ -11,7 +11,9 @@ from app.services.ocr.types import Response
 class OCRProvider(Protocol):
     name: str
     is_demo: bool
-    is_configured: bool
+
+    @property
+    def is_configured(self) -> bool: ...
 
     async def recognize_questions(
         self,

@@ -55,8 +55,170 @@ def test_ocr_configuration_defaults_are_server_controlled() -> None:
     assert settings.tencentcloud_ocr_max_concurrency == 2
     assert settings.tencentcloud_ocr_queue_timeout_seconds == 5
     assert settings.tencentcloud_ocr_max_retries == 2
+    assert settings.ocr_processing_lease_seconds == 180
     assert settings.ocr_rate_limit_per_minute == 5
     assert settings.ocr_rate_limit_per_hour == 50
+
+
+def test_upload_resource_limit_defaults_are_server_controlled() -> None:
+    settings = Settings()
+
+    assert settings.upload_max_concurrency == 2
+    assert settings.upload_queue_timeout_seconds == 5.0
+    assert settings.upload_rate_limit_per_minute == 10
+    assert settings.upload_rate_limit_per_hour == 100
+    assert settings.max_upload_bytes == 10 * 1024 * 1024
+
+
+UPLOAD_NUMERIC_BOUNDARIES = [
+    ("upload_max_concurrency", 1, 10),
+    ("upload_queue_timeout_seconds", 0.1, 60.0),
+    ("upload_rate_limit_per_minute", 1, 60),
+    ("upload_rate_limit_per_hour", 1, 1000),
+    ("max_upload_bytes", 1024 * 1024, 10 * 1024 * 1024),
+]
+
+
+@pytest.mark.parametrize(
+    ("field_name", "lower", "upper"),
+    UPLOAD_NUMERIC_BOUNDARIES,
+)
+def test_upload_numeric_configuration_accepts_documented_boundaries(
+    field_name: str,
+    lower: int | float,
+    upper: int | float,
+) -> None:
+    lower_overrides: dict[str, int | float] = {field_name: lower}
+    if field_name == "upload_rate_limit_per_hour":
+        lower_overrides["upload_rate_limit_per_minute"] = 1
+    lower_settings = Settings(_env_file=None, **lower_overrides)
+    upper_settings = Settings(_env_file=None, **{field_name: upper})
+
+    assert getattr(lower_settings, field_name) == lower
+    assert getattr(upper_settings, field_name) == upper
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        *[(field_name, 0) for field_name, _, _ in UPLOAD_NUMERIC_BOUNDARIES],
+        *[
+            (field_name, upper + 1)
+            for field_name, _, upper in UPLOAD_NUMERIC_BOUNDARIES
+        ],
+        ("upload_queue_timeout_seconds", 0.09),
+        ("max_upload_bytes", 1024 * 1024 - 1),
+    ],
+)
+def test_upload_numeric_configuration_rejects_unsafe_values(
+    field_name: str,
+    invalid_value: int | float,
+) -> None:
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, **{field_name: invalid_value})
+
+
+def test_upload_minute_rate_limit_cannot_exceed_hour_limit() -> None:
+    with pytest.raises(ValueError, match="UPLOAD_RATE_LIMIT_PER_MINUTE"):
+        Settings(
+            _env_file=None,
+            upload_rate_limit_per_minute=11,
+            upload_rate_limit_per_hour=10,
+        )
+
+
+OCR_NUMERIC_BOUNDARIES = [
+    ("tencentcloud_ocr_timeout_seconds", 1, 60),
+    ("tencentcloud_ocr_max_concurrency", 1, 10),
+    ("tencentcloud_ocr_queue_timeout_seconds", 1, 60),
+    ("tencentcloud_ocr_max_retries", 0, 2),
+    ("ocr_processing_lease_seconds", 60, 3600),
+    ("ocr_rate_limit_per_minute", 1, 60),
+    ("ocr_rate_limit_per_hour", 1, 1000),
+    ("ocr_corrected_image_max_bytes", 1, 10 * 1024 * 1024),
+    ("ocr_corrected_images_max_total_bytes", 1, 10 * 1024 * 1024),
+    ("ocr_crop_max_artifacts", 1, 100),
+    ("ocr_crop_max_total_png_bytes", 1, 10 * 1024 * 1024),
+]
+
+
+@pytest.mark.parametrize(
+    ("field_name", "lower", "upper"),
+    OCR_NUMERIC_BOUNDARIES,
+)
+def test_ocr_numeric_configuration_accepts_documented_boundaries(
+    field_name: str,
+    lower: int,
+    upper: int,
+) -> None:
+    lower_overrides = {field_name: lower}
+    upper_overrides = {field_name: upper}
+    if field_name == "ocr_processing_lease_seconds":
+        lower_overrides.update(
+            {
+                "tencentcloud_ocr_timeout_seconds": 1,
+                "tencentcloud_ocr_queue_timeout_seconds": 1,
+                "tencentcloud_ocr_max_retries": 0,
+            }
+        )
+    elif field_name == "tencentcloud_ocr_timeout_seconds":
+        upper_overrides["ocr_processing_lease_seconds"] = 300
+    elif field_name == "ocr_rate_limit_per_minute":
+        upper_overrides["ocr_rate_limit_per_hour"] = upper
+    elif field_name == "ocr_rate_limit_per_hour":
+        lower_overrides["ocr_rate_limit_per_minute"] = lower
+
+    lower_settings = Settings(_env_file=None, **lower_overrides)
+    upper_settings = Settings(_env_file=None, **upper_overrides)
+
+    assert getattr(lower_settings, field_name) == lower
+    assert getattr(upper_settings, field_name) == upper
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        *[
+            (field_name, 0)
+            for field_name, lower, _ in OCR_NUMERIC_BOUNDARIES
+            if lower > 0
+        ],
+        ("tencentcloud_ocr_timeout_seconds", -1),
+        ("tencentcloud_ocr_max_retries", -1),
+        *[(field_name, upper + 1) for field_name, _, upper in OCR_NUMERIC_BOUNDARIES],
+    ],
+)
+def test_ocr_numeric_configuration_rejects_unsafe_values(
+    field_name: str,
+    invalid_value: int,
+) -> None:
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, **{field_name: invalid_value})
+
+
+def test_ocr_processing_lease_must_cover_the_longest_normal_processing_window() -> None:
+    required_lease = 5 + 30 * (2 + 1) + 30
+
+    settings = Settings(
+        _env_file=None,
+        ocr_processing_lease_seconds=required_lease,
+    )
+    assert settings.ocr_processing_lease_seconds == required_lease
+
+    with pytest.raises(ValueError, match="OCR_PROCESSING_LEASE_SECONDS"):
+        Settings(
+            _env_file=None,
+            ocr_processing_lease_seconds=required_lease - 1,
+        )
+
+
+def test_ocr_minute_rate_limit_cannot_exceed_hour_limit() -> None:
+    with pytest.raises(ValueError, match="OCR_RATE_LIMIT_PER_MINUTE"):
+        Settings(
+            _env_file=None,
+            ocr_rate_limit_per_minute=11,
+            ocr_rate_limit_per_hour=10,
+        )
 
 
 def test_tencent_ocr_invocation_contract_is_fixed() -> None:
@@ -250,10 +412,7 @@ def test_database_url_normalization(source: str, expected: str) -> None:
 
 
 def test_session_factory_normalizes_railway_database_url() -> None:
-    source = (
-        "postgres://us%40er:p%40ss%25word@"
-        "postgres.railway.internal:5432/kaogong"
-    )
+    source = "postgres://us%40er:p%40ss%25word@postgres.railway.internal:5432/kaogong"
     expected = (
         "postgresql+psycopg://us%40er:p%40ss%25word@"
         "postgres.railway.internal:5432/kaogong"
@@ -267,8 +426,7 @@ def test_session_factory_normalizes_railway_database_url() -> None:
 
 def test_alembic_accepts_url_encoded_credentials() -> None:
     database_url = (
-        "postgresql://us%40er:p%40ss%25word@"
-        "postgres.railway.internal:5432/kaogong"
+        "postgresql://us%40er:p%40ss%25word@postgres.railway.internal:5432/kaogong"
     )
     result = subprocess.run(
         [sys.executable, "-m", "alembic", "upgrade", "head", "--sql"],

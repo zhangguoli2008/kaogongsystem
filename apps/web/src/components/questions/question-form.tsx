@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useFieldArray, useForm } from "react-hook-form";
 import { Plus, Save, Trash2 } from "lucide-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 
 import { ImageOcrPanel } from "@/components/questions/image-ocr-panel";
@@ -20,11 +21,12 @@ import {
   type ExamModule,
   type ExamType,
   type MasteryStatus,
+  type OcrQuestion,
   type OcrResult,
   type Question,
   type QuestionInput,
+  type QuestionOcrMetadata,
   type QuestionOption,
-  type Upload,
 } from "@/types/api";
 
 export interface QuestionFormValues {
@@ -42,6 +44,14 @@ export interface QuestionFormValues {
   knowledge_points_text: string;
   error_reason: ErrorReason | "";
   mastery_status: MasteryStatus;
+}
+
+interface QuestionSaveSubmission {
+  values: QuestionFormValues;
+  ocrMetadata: QuestionOcrMetadata | null;
+  ocrDraftId: string | null;
+  removeOcrDraftAfterSave: (() => void) | null;
+  prepareAiAfterSave: boolean;
 }
 
 interface QuestionFormProps {
@@ -84,6 +94,59 @@ function nextOptionLabel(options: QuestionOption[]) {
   return String.fromCharCode("A".charCodeAt(0) + index);
 }
 
+function ocrMetadataFor(question: OcrQuestion, result: OcrResult): QuestionOcrMetadata {
+  return {
+    source: { asset_id: result.source.file_id },
+    question_number: question.question_number,
+    question_type: question.question_type,
+    full_text: question.full_text,
+    question_elements: question.question_elements,
+    coord: question.coord,
+    crop: question.crop_asset_id ? { asset_id: question.crop_asset_id } : null,
+    figures: question.figures.map((item) => ({
+      index: item.index,
+      text: item.text,
+      coord: item.coord,
+      asset: item.asset_id ? { asset_id: item.asset_id } : null,
+    })),
+    tables: question.tables.map((item) => ({
+      index: item.index,
+      text: item.text,
+      coord: item.coord,
+      asset: item.asset_id ? { asset_id: item.asset_id } : null,
+    })),
+    options: question.options.map((option) => ({
+      label: option.label,
+      coord: option.coord,
+      asset: option.asset_id ? { asset_id: option.asset_id } : null,
+    })),
+    recognized_answer: question.recognized_answer,
+    recognized_parse: question.recognized_parse,
+    warnings: [...new Set([...result.warnings, ...question.warnings])],
+  };
+}
+
+function formHasUserContent(values: QuestionFormValues) {
+  return Boolean(
+    values.stem.trim() ||
+    values.options.some((option) => option.content.trim()) ||
+    values.user_answer.trim() ||
+    values.correct_answer.trim() ||
+    values.original_explanation.trim() ||
+    values.notes.trim() ||
+    values.ocr_raw_text.trim(),
+  );
+}
+
+function valuesAfterImageSave(values: QuestionFormValues): QuestionFormValues {
+  return {
+    ...valuesFor(),
+    exam_type: values.exam_type,
+    module: values.module,
+    source: values.source,
+  };
+}
+
 export function QuestionForm({ mode, question, onSaved }: QuestionFormProps) {
   const router = useRouter();
   const queryClient = useQueryClient();
@@ -93,21 +156,34 @@ export function QuestionForm({ mode, question, onSaved }: QuestionFormProps) {
     handleSubmit,
     reset,
     getValues,
+    setValue,
     setError,
     clearErrors,
-    formState: { errors },
+    formState: { errors, isDirty },
   } = useForm<QuestionFormValues>({ defaultValues: valuesFor(question) });
   const options = useFieldArray({ control, name: "options" });
   const loadedQuestionId = useRef(question?.id);
+  const [loadedOcrDraft, setLoadedOcrDraft] = useState<{
+    temporaryId: string;
+    removeAfterSave: () => void;
+  } | null>(null);
+  const [ocrMetadata, setOcrMetadata] = useState<QuestionOcrMetadata | null>(question?.ocr_metadata ?? null);
+  const [prepareAiAfterSave, setPrepareAiAfterSave] = useState(false);
+  const [lastSaved, setLastSaved] = useState<{ question: Question; prepareAi: boolean } | null>(null);
 
   useEffect(() => {
     if (loadedQuestionId.current === question?.id) return;
     loadedQuestionId.current = question?.id;
+    setLoadedOcrDraft(null);
+    setOcrMetadata(question?.ocr_metadata ?? null);
+    setPrepareAiAfterSave(false);
+    setLastSaved(null);
     reset(valuesFor(question));
   }, [question, reset]);
 
   const saveQuestion = useMutation({
-    mutationFn: (values: QuestionFormValues) => {
+    mutationFn: (submission: QuestionSaveSubmission) => {
+      const { values } = submission;
       const payload: QuestionInput = {
         exam_type: values.exam_type,
         module: values.module,
@@ -122,6 +198,7 @@ export function QuestionForm({ mode, question, onSaved }: QuestionFormProps) {
         notes: values.notes.trim() || null,
         image_path: values.image_path || null,
         ocr_raw_text: values.ocr_raw_text || null,
+        ocr_metadata: submission.ocrMetadata,
         knowledge_points: values.knowledge_points_text.split(/[、,，]/).map((value) => value.trim()).filter(Boolean),
         error_reason: values.error_reason || null,
         mastery_status: values.mastery_status,
@@ -132,12 +209,26 @@ export function QuestionForm({ mode, question, onSaved }: QuestionFormProps) {
         body: JSON.stringify(payload),
       });
     },
-    onSuccess: (saved) => {
+    onSuccess: (saved, submission) => {
       queryClient.setQueryData(["question", saved.id], saved);
       queryClient.invalidateQueries({ queryKey: ["questions"] });
       onSaved?.(saved);
       if (!question) {
-        router.push(`/questions/${saved.id}`);
+        if (mode === "image") {
+          submission.removeOcrDraftAfterSave?.();
+          setLastSaved({
+            question: saved,
+            prepareAi: submission.prepareAiAfterSave,
+          });
+          if (loadedOcrDraft?.temporaryId === submission.ocrDraftId) {
+            setLoadedOcrDraft(null);
+            setOcrMetadata(null);
+            setPrepareAiAfterSave(false);
+            reset(valuesAfterImageSave(submission.values));
+          }
+        } else {
+          router.push(`/questions/${saved.id}`);
+        }
       }
     },
     onError: (error) => {
@@ -165,26 +256,86 @@ export function QuestionForm({ mode, question, onSaved }: QuestionFormProps) {
     },
   });
 
-  function applyOcr(result: OcrResult, upload: Upload) {
+  function loadOcrQuestion(
+    ocrQuestion: OcrQuestion,
+    result: OcrResult,
+    intent: "edit" | "analyze",
+    removeAfterSave: () => void,
+  ) {
+    if (saveQuestion.isPending) return false;
+    const currentValues = getValues();
+    const wouldOverwrite = isDirty || loadedOcrDraft !== null || formHasUserContent(currentValues);
+    if (wouldOverwrite && !window.confirm("当前表单有未保存内容，载入识别题目会覆盖题干和选项，确定继续吗？")) {
+      return false;
+    }
+
     reset({
-      ...getValues(),
-      stem: result.stem,
-      options: result.options,
-      user_answer: result.user_answer,
-      correct_answer: result.correct_answer,
-      original_explanation: result.original_explanation,
-      image_path: `/uploads/${upload.id}`,
-      ocr_raw_text: result.raw_text,
+      ...currentValues,
+      stem: ocrQuestion.question_text,
+      options: ocrQuestion.options
+        .map((option) => ({ label: option.label, content: option.text }))
+        .filter((option) => option.label.trim() && option.content.trim()),
+      image_path: result.source.image_url,
+      ocr_raw_text: ocrQuestion.full_text,
+    });
+    setLoadedOcrDraft({
+      temporaryId: ocrQuestion.temporary_id,
+      removeAfterSave,
+    });
+    setOcrMetadata(ocrMetadataFor(ocrQuestion, result));
+    setPrepareAiAfterSave(intent === "analyze");
+    return true;
+  }
+
+  function adoptOcrAnswer(
+    ocrQuestion: OcrQuestion,
+    result: OcrResult,
+    removeAfterSave: () => void,
+  ) {
+    if (loadedOcrDraft?.temporaryId !== ocrQuestion.temporary_id && !loadOcrQuestion(ocrQuestion, result, "edit", removeAfterSave)) return;
+    setLoadedOcrDraft({ temporaryId: ocrQuestion.temporary_id, removeAfterSave });
+    setOcrMetadata(ocrMetadataFor(ocrQuestion, result));
+    if (ocrQuestion.recognized_answer?.trim()) {
+      setValue("correct_answer", ocrQuestion.recognized_answer.trim(), { shouldDirty: true });
+    }
+  }
+
+  function adoptOcrParse(
+    ocrQuestion: OcrQuestion,
+    result: OcrResult,
+    removeAfterSave: () => void,
+  ) {
+    if (loadedOcrDraft?.temporaryId !== ocrQuestion.temporary_id && !loadOcrQuestion(ocrQuestion, result, "edit", removeAfterSave)) return;
+    setLoadedOcrDraft({ temporaryId: ocrQuestion.temporary_id, removeAfterSave });
+    setOcrMetadata(ocrMetadataFor(ocrQuestion, result));
+    if (ocrQuestion.recognized_parse?.trim()) {
+      setValue("original_explanation", ocrQuestion.recognized_parse.trim(), { shouldDirty: true });
+    }
+  }
+
+  function submitQuestion(values: QuestionFormValues) {
+    clearErrors();
+    saveQuestion.mutate({
+      values,
+      ocrMetadata,
+      ocrDraftId: loadedOcrDraft?.temporaryId ?? null,
+      removeOcrDraftAfterSave: loadedOcrDraft?.removeAfterSave ?? null,
+      prepareAiAfterSave,
     });
   }
 
   return (
     <div className={mode === "image" ? "grid gap-6 xl:grid-cols-[minmax(19rem,0.8fr)_minmax(0,1.2fr)]" : "mx-auto max-w-4xl"}>
-      {mode === "image" ? <ImageOcrPanel onRecognized={applyOcr} /> : null}
-      <form className="rounded-xl border border-[#E4E8F2] bg-white p-5 sm:p-6" noValidate onSubmit={handleSubmit((values) => {
-        clearErrors();
-        saveQuestion.mutate(values);
-      })}>
+      {mode === "image" ? (
+        <ImageOcrPanel
+          draftActionsDisabled={saveQuestion.isPending}
+          onLoadQuestion={loadOcrQuestion}
+          onAdoptAnswer={adoptOcrAnswer}
+          onAdoptParse={adoptOcrParse}
+        />
+      ) : null}
+      <form className="rounded-xl border border-[#E4E8F2] bg-white p-5 sm:p-6" noValidate onSubmit={handleSubmit(submitQuestion)}>
+        <fieldset className="contents" disabled={saveQuestion.isPending}>
         <div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#E8ECF4] pb-5">
           <div>
             <h2 className="text-lg font-semibold text-[#0D1B4C]">{question ? "编辑错题" : "题目内容"}</h2>
@@ -192,6 +343,22 @@ export function QuestionForm({ mode, question, onSaved }: QuestionFormProps) {
           </div>
           {mode === "image" ? <span className="rounded-md bg-[#EEF0FF] px-2 py-1 text-xs font-medium text-[#4F46E5]">识别结果可编辑</span> : null}
         </div>
+
+        {prepareAiAfterSave ? (
+          <p className="mt-5 rounded-lg border border-[#D9DDFE] bg-[#F5F5FF] px-4 py-3 text-sm leading-6 text-[#4338CA]" role="status">
+            已准备 AI 分析：请先保存这道错题，进入详情页后再点击现有“开始分析”按钮。
+          </p>
+        ) : null}
+
+        {lastSaved ? (
+          <div className="mt-5 rounded-lg border border-[#BDE7D8] bg-[#F2FBF7] px-4 py-3 text-sm leading-6 text-[#087F67]" role="status">
+            <span>错题已保存，可继续载入下一道识别题。</span>{" "}
+            <Link className="font-semibold underline underline-offset-2" href={`/questions/${lastSaved.question.id}`}>
+              查看已保存错题
+            </Link>
+            {lastSaved.prepareAi ? <span>；打开详情后可手动开始 AI 分析。</span> : null}
+          </div>
+        ) : null}
 
         <div className="mt-6 grid gap-5 sm:grid-cols-2">
           <Field label="考试类型" htmlFor="exam_type" error={errors.exam_type?.message}>
@@ -281,6 +448,7 @@ export function QuestionForm({ mode, question, onSaved }: QuestionFormProps) {
             {saveQuestion.isPending ? "正在保存…" : question ? "保存修改" : "保存错题"}
           </Button>
         </div>
+        </fieldset>
       </form>
     </div>
   );

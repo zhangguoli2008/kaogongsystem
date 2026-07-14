@@ -48,7 +48,7 @@ async def update_review_settings(
     else:
         settings.daily_review_limit = payload.daily_review_limit
     await session.commit()
-    return ReviewSettingsRead(daily_review_limit=settings.daily_review_limit)
+    return ReviewSettingsRead(daily_review_limit=payload.daily_review_limit)
 
 
 @router.get(
@@ -85,7 +85,7 @@ async def question_review_history(
         .limit(page_size)
     )
     return ReviewRecordPage(
-        items=list(records),
+        items=[ReviewRecordRead.model_validate(record) for record in records],
         page=page,
         page_size=page_size,
         total=total or 0,

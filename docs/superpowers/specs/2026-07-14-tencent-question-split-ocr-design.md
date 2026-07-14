@@ -59,7 +59,7 @@
 - `UseNewModel=false`
 - 请求超时默认 30 秒
 
-SDK 客户端按应用复用；同步网络调用通过线程池执行。全局 Semaphore 默认 2，获取许可有界等待。最多重试 2 次，只重试临时网络、超时、内部错误和服务端错误，采用指数退避与少量随机抖动。
+SDK 客户端按应用复用；同步网络调用通过线程池执行。全局 Semaphore 默认 2，获取许可有界等待，并覆盖 Provider、规范化、裁剪、资产持久化和终态 CAS 的完整处理阶段。最多重试 2 次，只重试临时网络、超时、内部错误和服务端错误，采用指数退避与少量随机抖动。
 
 ## 4. 配置与秘密
 
@@ -73,10 +73,11 @@ SDK 客户端按应用复用；同步网络调用通过线程池执行。全局 
 - `TENCENTCLOUD_OCR_MAX_CONCURRENCY=2`
 - `TENCENTCLOUD_OCR_QUEUE_TIMEOUT_SECONDS=5`
 - `TENCENTCLOUD_OCR_MAX_RETRIES=2`
+- `OCR_PROCESSING_LEASE_SECONDS=180`
 - `OCR_RATE_LIMIT_PER_MINUTE=5`
 - `OCR_RATE_LIMIT_PER_HOUR=50`
 
-真实值只放在被 Git 忽略的仓库根 `.env` 或部署平台后端变量中。缺少密钥不得阻止应用启动；仅在选择腾讯 Provider 并调用 OCR 时返回 `OCR_NOT_CONFIGURED`。状态接口不暴露缺少的是哪一项，不返回路径、密钥或 SDK 内部信息。
+没有 heartbeat 时，处理租约必须至少为“排队超时 + 请求超时 ×（重试次数 + 1）+ 30 秒”，默认最低 125 秒、实际配置 180 秒；OCR 分钟限额不得大于小时限额。真实值只放在被 Git 忽略的仓库根 `.env` 或部署平台后端变量中。缺少密钥不得阻止应用启动；仅在选择腾讯 Provider 并调用 OCR 时返回 `OCR_NOT_CONFIGURED`。状态接口不暴露缺少的是哪一项，不返回路径、密钥或 SDK 内部信息。
 
 ## 5. 上传、验证与质量提示
 
@@ -156,7 +157,7 @@ SDK 客户端按应用复用；同步网络调用通过线程池执行。全局 
 
 日志只记录 `user_id`、provider、API 名、腾讯 RequestId、耗时、成功与否、题数、错误码、文件大小和 PDF 页码；不记录题目全文、图片、Base64、密钥、签名、绝对路径或完整 SDK 请求/响应。
 
-只有登录用户可调用 OCR。每用户默认 5 次/分钟且 50 次/小时；应用级限流的多实例局限会在部署文档明确说明。默认测试全部注入 Mock SDK，不调用腾讯。真实冒烟测试必须显式设置 `RUN_TENCENT_QUESTION_SPLIT_OCR_E2E=1`，只调用一次并输出脱敏的 RequestId 与题数。
+只有登录用户可调用 OCR。上传请求在 multipart 解析和鉴权前按声明长度与实际流式字节双重限制，并由入口 Semaphore 约束未认证并发；解码、裁剪、写盘和提交 worker 在请求取消后也必须完成或清理，不能提前释放并发名额。每用户默认 5 次/分钟且 50 次/小时；应用级限流的多实例局限会在部署文档明确说明。默认测试全部注入 Mock SDK，不调用腾讯。真实冒烟测试必须显式设置 `RUN_TENCENT_QUESTION_SPLIT_OCR_E2E=1`，只调用一次并输出脱敏的 RequestId 与题数。
 
 ## 10. 数据流
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Request, UploadFile, status
@@ -8,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
+from app.core.async_tasks import await_task_outcome
 from app.core.database import get_session
 from app.core.errors import APIError
 from app.models.upload import UploadedAsset
@@ -29,6 +32,25 @@ router = APIRouter(prefix="/uploads", tags=["uploads"])
 Session = Annotated[AsyncSession, Depends(get_session)]
 
 
+async def _finish_failed_upload(
+    session: AsyncSession,
+    *,
+    upload_dir: Path,
+    storage_name: str,
+) -> BaseException | None:
+    cleanup = asyncio.create_task(
+        asyncio.to_thread(
+            image_path(upload_dir, storage_name).unlink,
+            missing_ok=True,
+        )
+    )
+    cleanup_outcome = await await_task_outcome(cleanup)
+
+    rollback = asyncio.create_task(session.rollback())
+    rollback_outcome = await await_task_outcome(rollback)
+    return cleanup_outcome.error or rollback_outcome.error
+
+
 @router.post(
     "/questions", response_model=UploadRead, status_code=status.HTTP_201_CREATED
 )
@@ -39,12 +61,33 @@ async def upload_question_image(
     request: Request,
 ) -> UploadRead:
     settings = request.app.state.settings
-    try:
-        stored = await save_image(
-            file,
-            upload_dir=settings.upload_dir,
-            max_upload_bytes=settings.max_upload_bytes,
+    if not request.app.state.upload_rate_limiter.allow(current_user.id):
+        raise APIError(
+            429,
+            "UPLOAD_RATE_LIMITED",
+            "上传请求过于频繁，请稍后再试",
         )
+
+    try:
+        await asyncio.wait_for(
+            request.app.state.upload_semaphore.acquire(),
+            timeout=settings.upload_queue_timeout_seconds,
+        )
+    except TimeoutError as exc:
+        raise APIError(
+            429,
+            "UPLOAD_RATE_LIMITED",
+            "上传服务繁忙，请稍后重试",
+        ) from exc
+    try:
+        try:
+            stored = await save_image(
+                file,
+                upload_dir=settings.upload_dir,
+                max_upload_bytes=settings.max_upload_bytes,
+            )
+        finally:
+            request.app.state.upload_semaphore.release()
     except UnsupportedImageType as exc:
         raise APIError(
             422,
@@ -52,7 +95,9 @@ async def upload_question_image(
             "仅支持 JPEG、PNG、BMP 图片或 PDF 文件",
         ) from exc
     except InvalidImage as exc:
-        raise APIError(422, "OCR_IMAGE_DECODE_FAILED", "图片文件损坏或无法解析") from exc
+        raise APIError(
+            422, "OCR_IMAGE_DECODE_FAILED", "图片文件损坏或无法解析"
+        ) from exc
     except InvalidPdf as exc:
         raise APIError(422, "OCR_INVALID_PDF", "PDF 文件损坏或无法解析") from exc
     except EmptyFile as exc:
@@ -74,12 +119,23 @@ async def upload_question_image(
         size_bytes=stored.size_bytes,
     )
     session.add(asset)
-    try:
-        await session.commit()
-    except Exception:
-        image_path(settings.upload_dir, stored.storage_name).unlink(missing_ok=True)
-        await session.rollback()
-        raise
+    commit = asyncio.create_task(session.commit())
+    commit_outcome = await await_task_outcome(commit)
+    if commit_outcome.error is not None:
+        cleanup_error = await _finish_failed_upload(
+            session,
+            upload_dir=settings.upload_dir,
+            storage_name=stored.storage_name,
+        )
+        if cleanup_error is not None and not commit_outcome.caller_cancelled:
+            raise cleanup_error
+        if commit_outcome.caller_cancelled:
+            raise asyncio.CancelledError from commit_outcome.error
+        raise commit_outcome.error
+    if commit_outcome.caller_cancelled:
+        # A successful commit owns both the row and file.  Keep that consistent
+        # state even though the disconnected caller will not receive the ID.
+        raise asyncio.CancelledError
     await session.refresh(asset)
     return UploadRead(
         id=asset.id,
