@@ -122,6 +122,30 @@ async def test_tencent_provider_builds_fixed_image_request_and_reuses_client(
 
 
 @pytest.mark.anyio
+async def test_tencent_provider_applies_configured_timeout_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tencent, _ = _provider_modules()
+    timeouts: list[int] = []
+
+    class FakeClient:
+        def __init__(self, credential: Any, region: str, profile: Any) -> None:
+            timeouts.append(profile.httpProfile.reqTimeout)
+
+        def QuestionSplitOCR(self, request: Any) -> models.QuestionSplitOCRResponse:
+            return _sdk_response()
+
+    monkeypatch.setattr(ocr_client, "OcrClient", FakeClient)
+    provider = tencent.TencentOCRProvider(
+        _settings(tencentcloud_ocr_timeout_seconds=17)
+    )
+
+    await provider.recognize_questions(b"image", "question.jpg", "image/jpeg")
+
+    assert timeouts == [17]
+
+
+@pytest.mark.anyio
 async def test_pdf_page_is_set_only_for_canonical_pdf_content_type(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -373,6 +397,64 @@ def test_local_error_mapping_is_safe(
 
 
 @pytest.mark.parametrize(
+    ("incoming_code", "status_code", "message", "retryable"),
+    [
+        ("OCR_NOT_CONFIGURED", 503, "OCR 服务未配置", False),
+        ("OCR_IMAGE_DECODE_FAILED", 422, "无法解析上传的图片", False),
+        ("OCR_SERVICE_NOT_OPEN", 503, "OCR 服务未开通", False),
+        ("OCR_FILE_TOO_LARGE", 413, "上传文件过大", False),
+        ("OCR_ACCOUNT_IN_ARREARS", 503, "OCR 账户欠费", False),
+        ("OCR_RESOURCE_PACKAGE_RUN_OUT", 503, "OCR 资源包已用尽", False),
+        ("OCR_BILLING_ERROR", 503, "OCR 计费状态异常", False),
+        ("OCR_CREDENTIAL_ERROR", 503, "OCR 服务凭证无效", False),
+        ("OCR_RATE_LIMITED", 429, "OCR 请求过于频繁", True),
+        ("OCR_PROVIDER_TIMEOUT", 504, "OCR 服务响应超时", True),
+        ("OCR_PROVIDER_ERROR", 502, "OCR 服务暂时不可用", False),
+        ("UNTRUSTED_DOMAIN_CODE", 502, "OCR 服务暂时不可用", False),
+    ],
+)
+def test_existing_domain_errors_are_rebuilt_from_safe_allowlist(
+    incoming_code: str,
+    status_code: int,
+    message: str,
+    retryable: bool,
+) -> None:
+    _, errors = _provider_modules()
+    secret = "secret-id raw-image-base64 original domain detail"
+    original = errors.OCRProviderError(
+        status_code=418,
+        code=incoming_code,
+        message=secret,
+        retryable=not retryable,
+        provider_code=secret,
+        request_id=secret,
+    )
+    original.__cause__ = RuntimeError(secret)
+    original.__context__ = RuntimeError(secret)
+    try:
+        raise original
+    except errors.OCRProviderError as caught:
+        original = caught
+
+    mapped = errors.map_provider_exception(original)
+
+    assert mapped is not original
+    assert (mapped.status_code, mapped.code, mapped.message, mapped.retryable) == (
+        status_code,
+        incoming_code if incoming_code != "UNTRUSTED_DOMAIN_CODE" else "OCR_PROVIDER_ERROR",
+        message,
+        retryable,
+    )
+    assert mapped.provider_code is None
+    assert mapped.request_id is None
+    assert mapped.__traceback__ is None
+    assert mapped.__cause__ is None
+    assert mapped.__context__ is None
+    rendered = f"{mapped!s} {mapped!r} {vars(mapped)!r}"
+    assert secret not in rendered
+
+
+@pytest.mark.parametrize(
     ("provider_code", "expected_domain_code"),
     [
         ("FailedOperation.OcrFailed", "OCR_PROVIDER_ERROR"),
@@ -555,6 +637,10 @@ async def test_mock_provider_is_deterministic_multi_question_official_shape() ->
     assert any(group.question for group in groups)
     assert any(group.figure for group in groups)
     assert any(group.table for group in groups)
+    assert [
+        [question.group_type for question in group.question or []]
+        for group in groups
+    ] == [["multiple-choice"], ["problem-solving"]]
 
 
 def test_factory_centralizes_mock_and_tencent_selection() -> None:

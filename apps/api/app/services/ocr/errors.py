@@ -8,6 +8,21 @@ from tencentcloud.common.exception.tencent_cloud_sdk_exception import (
 )
 
 
+_DOMAIN_ERROR_SPECS: dict[str, tuple[int, str, bool]] = {
+    "OCR_NOT_CONFIGURED": (503, "OCR 服务未配置", False),
+    "OCR_IMAGE_DECODE_FAILED": (422, "无法解析上传的图片", False),
+    "OCR_SERVICE_NOT_OPEN": (503, "OCR 服务未开通", False),
+    "OCR_FILE_TOO_LARGE": (413, "上传文件过大", False),
+    "OCR_ACCOUNT_IN_ARREARS": (503, "OCR 账户欠费", False),
+    "OCR_RESOURCE_PACKAGE_RUN_OUT": (503, "OCR 资源包已用尽", False),
+    "OCR_BILLING_ERROR": (503, "OCR 计费状态异常", False),
+    "OCR_CREDENTIAL_ERROR": (503, "OCR 服务凭证无效", False),
+    "OCR_RATE_LIMITED": (429, "OCR 请求过于频繁", True),
+    "OCR_PROVIDER_TIMEOUT": (504, "OCR 服务响应超时", True),
+    "OCR_PROVIDER_ERROR": (502, "OCR 服务暂时不可用", False),
+}
+
+
 class OCRProviderError(Exception):
     """An OCR failure safe to expose without upstream error details."""
 
@@ -57,7 +72,14 @@ def map_provider_exception(exc: Exception) -> OCRProviderError:
     """Map an upstream exception without retaining its original message."""
 
     if isinstance(exc, OCRProviderError):
-        return exc
+        incoming_code = exc.code if isinstance(exc.code, str) else ""
+        code = (
+            incoming_code
+            if incoming_code in _DOMAIN_ERROR_SPECS
+            else "OCR_PROVIDER_ERROR"
+        )
+        status_code, message, retryable = _DOMAIN_ERROR_SPECS[code]
+        return _error(status_code, code, message, retryable)
     if isinstance(exc, (TimeoutError, requests_exceptions.Timeout)):
         return _error(504, "OCR_PROVIDER_TIMEOUT", "OCR 服务响应超时", True)
     if isinstance(exc, (ConnectionError, requests_exceptions.ConnectionError)):

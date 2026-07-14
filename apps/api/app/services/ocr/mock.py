@@ -34,7 +34,7 @@ class MockOCRProvider:
                                     {
                                         "Index": 0,
                                         "Text": "1. 某数增加 20% 后为 120，原数是多少？",
-                                        "GroupType": "question",
+                                        "GroupType": "multiple-choice",
                                     }
                                 ],
                                 "Option": [
@@ -54,7 +54,7 @@ class MockOCRProvider:
                                     {
                                         "Index": 1,
                                         "Text": "2. 根据表格比较两组数据。",
-                                        "GroupType": "question",
+                                        "GroupType": "problem-solving",
                                     }
                                 ],
                                 "Option": [],
