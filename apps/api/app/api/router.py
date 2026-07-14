@@ -9,6 +9,7 @@ from app.api.routes.questions import router as questions_router
 from app.api.routes.reviews import router as reviews_router
 from app.api.routes.uploads import router as uploads_router
 from app.models.analysis import Analysis  # noqa: F401
+from app.services.ocr_contract import API_NAME, USE_NEW_MODEL
 
 api_router = APIRouter(prefix="/api/v1")
 
@@ -25,11 +26,11 @@ async def ocr_status(
     return {
         "provider": settings.ocr_provider,
         "configured": configured,
-        "api_name": "QuestionSplitOCR",
+        "api_name": API_NAME,
         "supports_multi_question": True,
         "supports_pdf": True,
         "supports_options": True,
-        "use_new_model": settings.tencentcloud_ocr_use_new_model,
+        "use_new_model": USE_NEW_MODEL,
     }
 
 

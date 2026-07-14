@@ -61,15 +61,12 @@ class Settings(BaseSettings):
     tencentcloud_secret_id: str | None = None
     tencentcloud_secret_key: str | None = None
     tencentcloud_region: str = ""
-    tencentcloud_ocr_endpoint: str = "ocr.tencentcloudapi.com"
     tencentcloud_ocr_timeout_seconds: int = 30
     tencentcloud_ocr_max_concurrency: int = 2
     tencentcloud_ocr_queue_timeout_seconds: int = 5
     tencentcloud_ocr_max_retries: int = 2
     ocr_rate_limit_per_minute: int = 5
     ocr_rate_limit_per_hour: int = 50
-    tencentcloud_ocr_use_new_model: bool = False
-    tencentcloud_ocr_enable_image_crop: bool = True
     upload_dir: Path = Path("/data/uploads")
     max_upload_bytes: int = 10 * 1024 * 1024
     allowed_origins: list[str] = ["http://localhost:3000"]

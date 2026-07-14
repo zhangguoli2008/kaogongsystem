@@ -9,6 +9,15 @@ from fastapi.testclient import TestClient
 from app.core.config import Settings
 from app.core.database import create_session_factory, normalize_database_url
 from app.main import create_app
+from app.services.ocr_contract import (
+    ACTION,
+    API_NAME,
+    API_VERSION,
+    ENABLE_IMAGE_CROP,
+    ENABLE_ONLY_DETECT_BORDER,
+    ENDPOINT,
+    USE_NEW_MODEL,
+)
 
 
 API_ROOT = Path(__file__).parents[1]
@@ -42,15 +51,40 @@ def test_ocr_configuration_defaults_are_server_controlled() -> None:
     assert settings.tencentcloud_secret_id is None
     assert settings.tencentcloud_secret_key is None
     assert settings.tencentcloud_region == ""
-    assert settings.tencentcloud_ocr_endpoint == "ocr.tencentcloudapi.com"
     assert settings.tencentcloud_ocr_timeout_seconds == 30
     assert settings.tencentcloud_ocr_max_concurrency == 2
     assert settings.tencentcloud_ocr_queue_timeout_seconds == 5
     assert settings.tencentcloud_ocr_max_retries == 2
     assert settings.ocr_rate_limit_per_minute == 5
     assert settings.ocr_rate_limit_per_hour == 50
-    assert settings.tencentcloud_ocr_use_new_model is False
-    assert settings.tencentcloud_ocr_enable_image_crop is True
+
+
+def test_tencent_ocr_invocation_contract_is_fixed() -> None:
+    assert API_NAME == "QuestionSplitOCR"
+    assert ACTION == "QuestionSplitOCR"
+    assert API_VERSION == "2018-11-19"
+    assert ENDPOINT == "ocr.tencentcloudapi.com"
+    assert USE_NEW_MODEL is False
+    assert ENABLE_IMAGE_CROP is True
+    assert ENABLE_ONLY_DETECT_BORDER is False
+
+
+def test_fixed_tencent_ocr_contract_ignores_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TENCENTCLOUD_OCR_ENDPOINT", "attacker.example")
+    monkeypatch.setenv("TENCENTCLOUD_OCR_USE_NEW_MODEL", "true")
+    monkeypatch.setenv("TENCENTCLOUD_OCR_ENABLE_IMAGE_CROP", "false")
+
+    settings = Settings(_env_file=None)
+    fixed_field_names = {
+        "tencentcloud_ocr_endpoint",
+        "tencentcloud_ocr_use_new_model",
+        "tencentcloud_ocr_enable_image_crop",
+    }
+
+    assert fixed_field_names.isdisjoint(Settings.model_fields)
+    assert fixed_field_names.isdisjoint(settings.model_dump())
 
 
 def test_missing_tencent_credentials_do_not_prevent_startup(tmp_path: Path) -> None:

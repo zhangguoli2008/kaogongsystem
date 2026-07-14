@@ -79,6 +79,9 @@ def test_tencent_ocr_status_is_configured_with_both_credentials(client) -> None:
 
 def test_client_cannot_override_server_controlled_ocr_status(client) -> None:
     register(client)
+    object.__setattr__(
+        client.app.state.settings, "tencentcloud_ocr_use_new_model", True
+    )
 
     response = client.get(
         "/api/v1/ocr/status",
