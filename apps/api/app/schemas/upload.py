@@ -25,7 +25,11 @@ class UploadRead(BaseModel):
 
 
 class OcrRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     upload_id: str = Field(min_length=1, max_length=36)
+    pdf_page_number: int = Field(default=1, ge=1)
+    idempotency_key: str | None = Field(default=None, max_length=128)
 
 
 class OcrResult(BaseModel):

@@ -12,6 +12,7 @@ from app.core.database import get_session
 from app.core.errors import APIError
 from app.core.security import ALGORITHM, SESSION_COOKIE
 from app.models.user import User
+from app.services.ocr.service import OCRService
 
 
 RAILWAY_EDGE_PATTERN = re.compile(r"railway/[a-z0-9-]+")
@@ -74,3 +75,10 @@ async def get_current_user(
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+def get_ocr_service(request: Request) -> OCRService:
+    return request.app.state.ocr_service
+
+
+OCRServiceDep = Annotated[OCRService, Depends(get_ocr_service)]

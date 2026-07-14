@@ -96,3 +96,13 @@ class OcrResult(OcrModel):
     warnings: list[str] = Field(default_factory=list)
     questions: list[OcrQuestion] = Field(default_factory=list)
     is_demo: bool = False
+
+
+class OcrStatus(OcrModel):
+    provider: Literal["mock", "tencent_question_split"]
+    configured: bool
+    api_name: Literal["QuestionSplitOCR"]
+    supports_multi_question: Literal[True]
+    supports_pdf: Literal[True]
+    supports_options: Literal[True]
+    use_new_model: Literal[False]

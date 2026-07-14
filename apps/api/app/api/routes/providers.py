@@ -6,15 +6,14 @@ from fastapi import APIRouter, Depends, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser
+from app.api.deps import CurrentUser, OCRServiceDep
 from app.core.database import get_session
 from app.core.errors import APIError, request_id_for
 from app.models.upload import UploadedAsset
-from app.schemas.upload import OcrRequest, OcrResult
-from app.services.providers.factory import get_provider
-from app.services.storage import image_path
+from app.schemas.ocr import OcrResult
+from app.schemas.upload import OcrRequest
 
-router = APIRouter(tags=["providers"])
+router = APIRouter(tags=["ocr"])
 Session = Annotated[AsyncSession, Depends(get_session)]
 
 
@@ -24,6 +23,7 @@ async def ocr_upload(
     current_user: CurrentUser,
     session: Session,
     request: Request,
+    ocr_service: OCRServiceDep,
 ) -> OcrResult:
     asset = await session.scalar(
         select(UploadedAsset).where(
@@ -32,15 +32,15 @@ async def ocr_upload(
         )
     )
     if asset is None:
-        raise APIError(404, "not_found", "上传文件不存在")
-    if not request.app.state.provider_rate_limiter.allow(current_user.id):
-        raise APIError(429, "provider_rate_limited", "OCR 请求过于频繁，请稍后再试")
-    try:
-        path = image_path(request.app.state.settings.upload_dir, asset.storage_name)
-        image_bytes = path.read_bytes()
-    except (OSError, ValueError) as exc:
-        raise APIError(404, "not_found", "上传文件不存在") from exc
-    provider = get_provider(request.app.state.settings)
-    return await provider.ocr(
-        image_bytes, asset.mime_type, request_id=request_id_for(request)
+        raise APIError(404, "OCR_SOURCE_NOT_FOUND", "未找到上传文件")
+
+    # The optional client key is accepted for retry-compatible clients, but the
+    # service deliberately derives its authoritative key from user/file/page/
+    # provider/parameter-version data.
+    return await ocr_service.recognize(
+        session,
+        user_id=current_user.id,
+        asset=asset,
+        pdf_page_number=payload.pdf_page_number,
+        local_request_id=request_id_for(request),
     )
