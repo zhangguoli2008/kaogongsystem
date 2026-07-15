@@ -1,0 +1,56 @@
+[project]
+name = "kaogong-api"
+version = "0.1.0"
+description = "Backend API for the AI exam diagnosis system"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "alembic",
+    "email-validator",
+    "fastapi",
+    "httpx",
+    "openai",
+    "pillow",
+    "psycopg",
+    "pypdf",
+    "pwdlib[argon2]",
+    "pydantic-settings",
+    "pyjwt",
+    "python-multipart",
+    "sqlalchemy[asyncio]",
+    "tencentcloud-sdk-python-ocr",
+    "uvicorn",
+]
+
+[dependency-groups]
+dev = [
+    "aiosqlite",
+    "httpx2>=2.0.0",
+    "mypy>=2.3.0",
+    "pytest",
+    "pytest-cov",
+    "ruff>=0.15.21",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["app"]
+strict = true
+explicit_package_bases = true
+show_error_codes = true
+pretty = true
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["tencentcloud", "tencentcloud.*"]
+ignore_missing_imports = true
