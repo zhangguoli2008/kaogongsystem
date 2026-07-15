@@ -13,6 +13,12 @@ The correction does not change the approved product outcome. It strengthens the 
 - the one allowed smoke cannot be resent by curl configuration, SDK retry, or an accidental restart of the same deployment workflow;
 - the outer workflow retains the temporary login state only after `LIVE2_VERIFIED`.
 
+## Pre-paid recovery record
+
+The first activation attempt on 2026-07-15 stopped before smoke registration, question upload, one-shot marker consumption, or any OCR request. Railway CLI 5.26.0 exposed the unique deployment message as `meta.cliMessage`, not `meta.deploymentMessage`; additionally, mode-0400/0500 archive entries remained root-owned after Docker `COPY`, so the UID-10001 runtime could not import `/app/app/main.py`. Activation deployment `90c4862d-4bab-4842-bdd9-8e787b09b35f` and its automatic rollback deployment `f70d067c-9b49-422b-a454-c344482c850d` therefore failed health checks.
+
+Production was recovered with the same pushed commit in deployment `3dd63738-4344-40fe-8ab0-5ed27a3c58f0`, using mode-0444 files and mode-0555 directories. Independent checks proved `demo + mock + retries=2`, healthy API/Web endpoints, zero users for the deterministic smoke email, and zero Tencent OCR tasks. A corrected paid rollout requires a fresh explicit user approval; the failed block must not be rerun automatically.
+
 ## Code-level one-shot invariants
 
 Before production activation, the branch must include and test all of these invariants:
@@ -25,13 +31,15 @@ Before production activation, the branch must include and test all of these inva
 6. the application test proves `TENCENTCLOUD_OCR_MAX_RETRIES=0` makes exactly one SDK call and performs no application retry sleep.
 7. `SMOKE_EMAIL` is deterministically tied to the full `DEPLOY_SHA`; if a process restart occurs after registration, the unique email stops the repeated workflow before OCR.
 8. The rollout fully decodes the approved image, copies the exact approved bytes into its private run directory, and verifies the server-downloaded upload against `SMOKE_IMAGE_SHA256` before consuming the one-shot marker.
-9. Every Railway upload comes from one read-only `git archive` snapshot of `DEPLOY_SHA`, and runtime verification is bound to the exact discovered deployment ID.
+9. Every Railway upload comes from one read-only, runtime-readable `git archive` snapshot of `DEPLOY_SHA` (files 0444, directories 0555), and runtime verification is bound to the exact discovered deployment ID.
+10. Railway CLI 5.26.0 uploads use detached mode without JSON/CI mode, and deployment discovery matches the unique `meta.cliMessage` field.
 
 Required gate:
 
 ~~~bash
 cd /Users/zhangguoli/Documents/Code/kaogongsystem/.worktrees/tencent-question-split-ocr/apps/api
 uv run pytest -q \
+  tests/test_live_ocr_rollout_plan.py \
   tests/test_ocr_one_shot_guard.py \
   tests/test_production_smoke_one_shot.py \
   tests/test_tencent_ocr_provider.py \
@@ -133,7 +141,7 @@ cleanup_deploy_material() {
   chmod -R u+w "$DEPLOY_SOURCE_DIR" 2>/dev/null || true
   rm -rf -- "$DEPLOY_SOURCE_DIR"
   chmod u+w "$APPROVED_IMAGE_FILE" 2>/dev/null || true
-  rm -f -- "$APPROVED_IMAGE_FILE" "$LIVE_RUN_DIR"/deploy-*.jsonl
+  rm -f -- "$APPROVED_IMAGE_FILE" "$LIVE_RUN_DIR"/deploy-*.log
 }
 
 cleanup_run_dir() {
@@ -167,8 +175,8 @@ chmod 600 "$LIVE_PASSWORD_FILE" "$LIVE_STATE_FILE" "$LIVE_EVIDENCE_FILE"
 mkdir "$DEPLOY_SOURCE_DIR"
 git archive "$DEPLOY_SHA" | tar -x -C "$DEPLOY_SOURCE_DIR"
 test -z "$(find "$DEPLOY_SOURCE_DIR" -type l -print -quit)"
-find "$DEPLOY_SOURCE_DIR" -type f -exec chmod 400 {} +
-find "$DEPLOY_SOURCE_DIR" -type d -exec chmod 500 {} +
+find "$DEPLOY_SOURCE_DIR" -type f -exec chmod 444 {} +
+find "$DEPLOY_SOURCE_DIR" -type d -exec chmod 555 {} +
 test -f "$DEPLOY_API_DIR/railway.json"
 
 cd "$WORKTREE/apps/api"
@@ -344,7 +352,7 @@ deployment_for_message() {
   "${railway_cli[@]}" deployment list \
     --service api --environment production --limit 100 --json |
     jq -r --arg message "$message" '
-      [.[] | select(.meta.deploymentMessage == $message)]
+      [.[] | select(.meta.cliMessage == $message)]
       | sort_by(.createdAt)
       | last
       | .id // empty
@@ -405,14 +413,14 @@ up_config() {
   local upload_status
   deploy_sequence=$((deploy_sequence + 1))
   message="codex-${RUN_TOKEN}-${deploy_sequence}-${provider}-${retries}-${DEPLOY_SHA:0:12}"
-  upload_log="$LIVE_RUN_DIR/deploy-${deploy_sequence}.jsonl"
+  upload_log="$LIVE_RUN_DIR/deploy-${deploy_sequence}.log"
   "${railway_cli[@]}" variable set \
     --service api --environment production --skip-deploys \
     OCR_PROVIDER="$provider" \
     TENCENTCLOUD_OCR_MAX_RETRIES="$retries" >/dev/null || return 1
   if "${railway_cli[@]}" up "$DEPLOY_API_DIR" --path-as-root \
     --service api --environment production \
-    --yes --detach --json --message "$message" >"$upload_log"; then
+    --yes --detach --message "$message" >"$upload_log"; then
     upload_status=0
   else
     upload_status=$?

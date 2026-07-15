@@ -628,7 +628,7 @@ WEB_URL="$WEB_URL" API_URL="$API_URL" SMOKE_STATE_FILE="$state_file" \
 真实付费 smoke 还必须满足以下不变量：
 
 - 在第一次 Railway 变量变更前安装 EXIT/HUP/INT/TERM finalizer。
-- 从当前干净、已推送提交创建只读 `git archive` 快照，并用它执行每一次 live/0、live/2 或 mock/2 部署；不要从可变工作树上传，也不要用含义不明确的 `redeploy latest` 代替回滚。每次运行态验收必须绑定该次上传的精确 deployment ID。
+- 从当前干净、已推送提交创建只读且运行用户可读的 `git archive` 快照（文件 0444、目录 0555），并用它执行每一次 live/0、live/2 或 mock/2 部署；0400/0500 会在 Docker `COPY` 后阻止 UID-10001 运行用户读取应用代码。不要从可变工作树上传，也不要用含义不明确的 `redeploy latest` 代替回滚。Railway CLI 5.26.0 应使用 detached 模式且不叠加 JSON/CI 模式，并通过唯一 `meta.cliMessage` 认领精确 deployment ID。
 - `TENCENTCLOUD_OCR_MAX_RETRIES=0` 的运行进程验证成功后才能调用。
 - 为真实模式提供与完整部署 SHA 绑定的显式 `SMOKE_EMAIL`、已批准图片的固定 `SMOKE_IMAGE_SHA256`，以及外部 mode-0700 目录中的 `SMOKE_OCR_ONE_SHOT_GUARD_FILE=.../paid-ocr.spent`；该文件在调用前必须不存在。
 - 对用户批准图片做完整解码并复制到私有只读快照；上传后、消费 one-shot 标记前，必须回读服务器文件并再次匹配固定 SHA-256。

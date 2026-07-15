@@ -131,7 +131,7 @@ EXIT trap 必须在阶段 B 的第一次 Railway 变量变更前安装。无论�
 - 真实 smoke 邮箱与部署 SHA 绑定；同一提交的流程重启会在注册阶段停止，不能生成第二个 OCR 任务。
 - one-shot 标记在唯一 OCR POST 紧前原子消费；传输结果不明确也视为本次额度已用，绝不自动重跑。
 - curl 不读取用户配置且 retry=0；腾讯 SDK 内部 retryer 为 NoopRetryer。
-- 所有部署使用同一个已推送提交生成的只读快照；激活、恢复与回滚均按精确 deployment ID 验证，不能从可变工作树或含义不明确的 latest 部署推断成功。
+- 所有部署使用同一个已推送提交生成的只读且运行用户可读快照（文件 0444、目录 0555）；激活、恢复与回滚均按 Railway CLI 5.26.0 的唯一 `meta.cliMessage` 认领精确 deployment ID，不能从可变工作树或含义不明确的 latest 部署推断成功。
 
 ## 10. 验证证据
 
