@@ -11,6 +11,7 @@ from requests import exceptions as requests_exceptions
 from tencentcloud.common.exception.tencent_cloud_sdk_exception import (
     TencentCloudSDKException,
 )
+from tencentcloud.common.retry import NoopRetryer
 from tencentcloud.ocr.v20181119 import models, ocr_client
 
 from app.core.config import Settings
@@ -119,6 +120,7 @@ async def test_tencent_provider_builds_fixed_image_request_and_reuses_client(
     assert instances[0].region == ""
     assert instances[0].profile.httpProfile.endpoint == "ocr.tencentcloudapi.com"
     assert instances[0].profile.httpProfile.reqTimeout == 30
+    assert isinstance(instances[0].profile.retryer, NoopRetryer)
 
 
 @pytest.mark.anyio
@@ -267,6 +269,44 @@ async def test_internal_error_retries_at_most_configured_limit(
     assert caught.value.retryable is True
     assert attempts == 3
     assert delays == [0.25, 0.5]
+
+
+@pytest.mark.anyio
+async def test_retryable_sdk_error_is_attempted_once_when_retries_are_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tencent, errors = _provider_modules()
+    attempts = 0
+    delays: list[float] = []
+
+    class FakeClient:
+        def __init__(self, credential: Any, region: str, profile: Any) -> None:
+            pass
+
+        def QuestionSplitOCR(self, request: Any) -> models.QuestionSplitOCRResponse:
+            nonlocal attempts
+            attempts += 1
+            raise TencentCloudSDKException(
+                "InternalError",
+                "sensitive upstream detail",
+                "req-no-retry",
+            )
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(ocr_client, "OcrClient", FakeClient)
+    provider = tencent.TencentOCRProvider(
+        _settings(tencentcloud_ocr_max_retries=0),
+        sleep=fake_sleep,
+        jitter=lambda: 0.0,
+    )
+
+    with pytest.raises(errors.OCRProviderError):
+        await provider.recognize_questions(b"image", "question.jpg", "image/jpeg")
+
+    assert attempts == 1
+    assert delays == []
 
 
 @pytest.mark.parametrize(

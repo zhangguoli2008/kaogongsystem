@@ -9,7 +9,7 @@
 
 ## 1. 目标与成功定义
 
-在不改变现有业务代码和 AI 模式的前提下，把正式环境 OCR Provider 从 mock 切换为 tencent_question_split，并用用户明确提供的非敏感公考试题图片完成一次真实 QuestionSplitOCR 付费调用。
+在不改变现有业务流程和 AI 模式的前提下，把正式环境 OCR Provider 从 mock 切换为 tencent_question_split，并用用户明确提供的非敏感公考试题图片完成一次真实 QuestionSplitOCR 付费调用。允许加入只服务于“一次付费验收”的 fail-closed 安全护栏。
 
 完成必须同时满足：
 
@@ -79,20 +79,20 @@ TENCENTCLOUD_REGION 不创建；应用的安全默认值为空。这样避免 Ra
 
 ### 阶段 C：单次真实调用
 
-使用 scripts/production-smoke.sh、独立的 mode-0600 状态文件、临时随机 smoke 密码和用户提供图片。设置 EXPECTED_OCR_PROVIDER=tencent_question_split。
+使用 scripts/production-smoke.sh、独立的 mode-0600 状态文件、临时随机 smoke 密码和用户提供图片。设置 EXPECTED_OCR_PROVIDER=tencent_question_split，并使用与完整部署 SHA 绑定的固定 smoke 邮箱、批准图片的固定 SHA-256，以及外部 mode-0700 目录中的原子 one-shot 标记。调用前先完整解码批准图片并复制到私有只读快照；上传后再回读服务器文件并匹配同一摘要。
 
-脚本只允许一个 POST /api/v1/ocr。服务端重试为 0，因此最多形成一次腾讯 QuestionSplitOCR 调用。验收保存 provider、脱敏 RequestId、question_count、第一题题干、题目/选项结构和受保护上传资产，不保存腾讯原始 Base64。
+脚本只允许一个 POST /api/v1/ocr，并在该 POST 紧前以 O_CREAT|O_EXCL 消费 one-shot 标记。curl 必须禁用 ~/.curlrc 且显式 retry=0；腾讯 SDK ClientProfile 必须显式使用 NoopRetryer；应用重试为 0。因此本次部署自动化最多形成一次腾讯 QuestionSplitOCR 调用。验收按固定 smoke 邮箱查询本次全部 OCRTask，保存 provider、脱敏 RequestId、question_count、第一题题干、题目/选项结构和受保护上传资产，不保存腾讯原始 Base64。
 
 ### 阶段 D：恢复正式重试
 
-无论阶段 C 成功、失败或被中断，EXIT trap 都必须：
+EXIT trap 必须在阶段 B 的第一次 Railway 变量变更前安装。无论阶段 B/C 成功、失败或被中断，都必须：
 
 1. 把 TENCENTCLOUD_OCR_MAX_RETRIES 恢复为 2。
 2. 重新部署 API。
 3. 通过 Railway SSH 断言运行进程实际读取到 2。
 4. 验证 /ready 成功。
 
-只有上述四项全部成功，真实 smoke 才能进入最终结论。
+只有上述四项全部成功，真实 smoke 才能进入最终结论。若 live/retries=2 恢复无法验证，必须继续尝试 mock/retries=2 并用当前已验证的 apps/api 树重新部署。
 
 ## 7. 失败与回滚
 
@@ -128,6 +128,10 @@ TENCENTCLOUD_REGION 不创建；应用的安全默认值为空。这样避免 Ra
 - 图片只发送给正式 Web/API 与腾讯 QuestionSplitOCR，用途仅为本次验收。
 - API 保持单副本，使现有进程级并发和速率限制仍是部署全局边界。
 - 真实调用前重试为 0，成功后恢复为 2。
+- 真实 smoke 邮箱与部署 SHA 绑定；同一提交的流程重启会在注册阶段停止，不能生成第二个 OCR 任务。
+- one-shot 标记在唯一 OCR POST 紧前原子消费；传输结果不明确也视为本次额度已用，绝不自动重跑。
+- curl 不读取用户配置且 retry=0；腾讯 SDK 内部 retryer 为 NoopRetryer。
+- 所有部署使用同一个已推送提交生成的只读快照；激活、恢复与回滚均按精确 deployment ID 验证，不能从可变工作树或含义不明确的 latest 部署推断成功。
 
 ## 10. 验证证据
 

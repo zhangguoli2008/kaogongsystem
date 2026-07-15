@@ -1,5 +1,7 @@
 # Railway Live Tencent OCR Implementation Plan
 
+> **Safety correction (2026-07-15):** Task 1 and Task 2 were completed. The original Task 3 through Task 5 commands below must not be executed because an independent review found gaps in automatic rollback, shell lifetime, curl/SDK retry suppression, and one-shot enforcement. They are superseded by [2026-07-15-railway-live-tencent-ocr-safety-correction.md](./2026-07-15-railway-live-tencent-ocr-safety-correction.md). Task 6 remains applicable only after the corrected rollout reports `LIVE2_VERIFIED`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox syntax for tracking.
 
 **Goal:** Switch the Railway production OCR provider from deterministic mock data to Tencent QuestionSplitOCR, perform exactly one paid OCR request with the approved non-sensitive exam image, restore normal retry settings, and verify the persisted result without a second paid request.

@@ -4,6 +4,8 @@ set -euo pipefail
 
 umask 077
 
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+
 die() {
   printf 'production smoke failed: %s\n' "$1" >&2
   exit 1
@@ -77,8 +79,16 @@ validate_origin API_URL "$API_URL"
 web_url=$WEB_URL
 api_url=$API_URL
 api_proxy="$web_url/api/v1"
-if [[ ${EXPECTED_OCR_PROVIDER:-mock} == "tencent_question_split" && -z ${SMOKE_IMAGE_PATH:-} ]]; then
-  die "SMOKE_IMAGE_PATH is required when EXPECTED_OCR_PROVIDER=tencent_question_split"
+expected_ocr_provider=${EXPECTED_OCR_PROVIDER:-mock}
+if [[ "$expected_ocr_provider" == "tencent_question_split" ]]; then
+  [[ -n ${SMOKE_IMAGE_PATH:-} ]] \
+    || die "SMOKE_IMAGE_PATH is required when EXPECTED_OCR_PROVIDER=tencent_question_split"
+  [[ -n ${SMOKE_EMAIL:-} ]] \
+    || die "SMOKE_EMAIL is required when EXPECTED_OCR_PROVIDER=tencent_question_split"
+  [[ -n ${SMOKE_OCR_ONE_SHOT_GUARD_FILE:-} ]] \
+    || die "SMOKE_OCR_ONE_SHOT_GUARD_FILE is required when EXPECTED_OCR_PROVIDER=tencent_question_split"
+  [[ -n ${SMOKE_IMAGE_SHA256:-} ]] \
+    || die "SMOKE_IMAGE_SHA256 is required when EXPECTED_OCR_PROVIDER=tencent_question_split"
 fi
 image_path=${SMOKE_IMAGE_PATH:-docs/design/ai-exam-diagnosis-dashboard-selected.png}
 
@@ -95,6 +105,47 @@ if any(character in path for character in ("\n", "\r", ";", ",")):
 print(path)
 PY
 )
+
+approved_image_sha=""
+if [[ "$expected_ocr_provider" == "tencent_question_split" ]]; then
+  approved_image_sha=$SMOKE_IMAGE_SHA256
+  [[ "$approved_image_sha" =~ ^[0-9a-f]{64}$ ]] \
+    || die "SMOKE_IMAGE_SHA256 must be 64 lowercase hexadecimal characters"
+  actual_image_sha=$(python3 - "$image_path" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    status = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(status.st_mode)
+        or status.st_uid != os.geteuid()
+        or status.st_nlink != 1
+    ):
+        raise SystemExit("SMOKE_IMAGE_PATH identity is unsafe")
+    digest = hashlib.sha256()
+    while chunk := os.read(descriptor, 1024 * 1024):
+        digest.update(chunk)
+    final_status = os.fstat(descriptor)
+    if (
+        final_status.st_dev,
+        final_status.st_ino,
+        final_status.st_size,
+        final_status.st_mtime_ns,
+    ) != (status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns):
+        raise SystemExit("SMOKE_IMAGE_PATH changed during digest verification")
+    print(digest.hexdigest())
+finally:
+    os.close(descriptor)
+PY
+  )
+  [[ "$actual_image_sha" == "$approved_image_sha" ]] \
+    || die "SMOKE_IMAGE_SHA256 mismatch"
+fi
 
 image_mime=$(python3 - "$image_path" <<'PY'
 import os
@@ -339,6 +390,8 @@ with open(sys.argv[1], "wb") as target:
 PY
 
 curl_common=(
+  --disable
+  --retry 0
   --silent
   --show-error
   --connect-timeout 10
@@ -672,9 +725,31 @@ upload_id=$(json_field "$tmp_dir/upload.json" id)
 assert_uuid "$upload_id"
 http_request 200 "$tmp_dir/uploaded-image" "$tmp_dir/upload-download.headers" \
   --cookie "$cookie_jar" "$api_proxy/uploads/$upload_id"
-cmp -s "$image_path" "$tmp_dir/uploaded-image" || die "downloaded upload differs from source"
+if [[ "$expected_ocr_provider" == "tencent_question_split" ]]; then
+downloaded_image_sha=$(python3 - "$tmp_dir/uploaded-image" <<'PY'
+import hashlib
+import sys
+
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as source:
+    while chunk := source.read(1024 * 1024):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
+  )
+  [[ "$downloaded_image_sha" == "$approved_image_sha" ]] \
+    || die "downloaded upload differs from approved image digest"
+else
+  cmp -s "$image_path" "$tmp_dir/uploaded-image" \
+    || die "downloaded upload differs from source"
+fi
 
 printf '{"upload_id":"%s"}' "$upload_id" >"$tmp_dir/ocr-request.json"
+if [[ "$expected_ocr_provider" == "tencent_question_split" ]]; then
+  python3 "$script_dir/consume-ocr-one-shot-guard.py" \
+    "$SMOKE_OCR_ONE_SHOT_GUARD_FILE" \
+    || die "real OCR one-shot guard is unsafe or already consumed"
+fi
 http_request 200 "$tmp_dir/ocr.json" "$tmp_dir/ocr.headers" \
   --cookie "$cookie_jar" \
   --header 'Content-Type: application/json' \

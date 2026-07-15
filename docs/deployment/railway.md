@@ -623,87 +623,21 @@ WEB_URL="$WEB_URL" API_URL="$API_URL" SMOKE_STATE_FILE="$state_file" \
   bash scripts/production-smoke.sh
 ```
 
-上面的首次 smoke 默认断言 `OCR_PROVIDER=mock`，不会调用腾讯，并可继续使用仓库内的 Dashboard 示例图。切换真实 OCR 后，如需显式做一次端到端付费 smoke，必须同时提供一张真实、非敏感公考试题图片的绝对路径；脚本不会为真实腾讯调用回退到 Dashboard 图。脚本只发出一个 OCR HTTP 请求，但无法覆盖 API 服务端重试配置，所以必须先把 API 的 `TENCENTCLOUD_OCR_MAX_RETRIES` 临时设为 `0` 并等到新部署健康。以下子 shell 的 EXIT trap 会在成功、失败或中断后把它恢复为 `2`，重新部署并验证；恢复失败时不得继续验收：
+上面的首次 smoke 默认断言 `OCR_PROVIDER=mock`，不会调用腾讯，并可继续使用仓库内的 Dashboard 示例图。切换真实 OCR 后，如需显式做一次端到端付费 smoke，必须使用经过审查的单一 shell 状态机，不能把“切换、调用、恢复、回滚”拆成独立命令块。当前可执行范本见 [`2026-07-15-railway-live-tencent-ocr-safety-correction.md`](../superpowers/plans/2026-07-15-railway-live-tencent-ocr-safety-correction.md)。
 
-```bash
-SMOKE_IMAGE_PATH=/absolute/path/to/non-sensitive-question.png
-test -f "$SMOKE_IMAGE_PATH"
-real_state_file=$(mktemp "$run_tmp/tencent-smoke-state.XXXXXX")
-chmod 600 "$real_state_file"
+真实付费 smoke 还必须满足以下不变量：
 
-(
-  set -euo pipefail
-  retry_override_started=0
+- 在第一次 Railway 变量变更前安装 EXIT/HUP/INT/TERM finalizer。
+- 从当前干净、已推送提交创建只读 `git archive` 快照，并用它执行每一次 live/0、live/2 或 mock/2 部署；不要从可变工作树上传，也不要用含义不明确的 `redeploy latest` 代替回滚。每次运行态验收必须绑定该次上传的精确 deployment ID。
+- `TENCENTCLOUD_OCR_MAX_RETRIES=0` 的运行进程验证成功后才能调用。
+- 为真实模式提供与完整部署 SHA 绑定的显式 `SMOKE_EMAIL`、已批准图片的固定 `SMOKE_IMAGE_SHA256`，以及外部 mode-0700 目录中的 `SMOKE_OCR_ONE_SHOT_GUARD_FILE=.../paid-ocr.spent`；该文件在调用前必须不存在。
+- 对用户批准图片做完整解码并复制到私有只读快照；上传后、消费 one-shot 标记前，必须回读服务器文件并再次匹配固定 SHA-256。
+- `scripts/production-smoke.sh` 在唯一 OCR POST 紧前原子消费 mode-0600 标记，并使用 `curl --disable --retry 0`；腾讯 SDK 使用 `NoopRetryer`。
+- smoke 密码文件用 `printf '%s' "$(openssl rand -hex 24)"` 创建，不能带换行。调用脚本时在受限子 shell 中把 `SMOKE_PASSWORD` 保持为非 export shell 变量，避免所有 curl/Python 子进程继承密码。
+- 调用、响应或后续证据只要出现不明确结果，就视为 one-shot 已用，不得重跑。先尝试 live/2；验收失败或 live/2 无法验证时继续切换并验证 mock/2。
+- 成功证据必须按固定 smoke 邮箱查询本次全部腾讯 OCRTask，要求恰好一条、状态 succeeded、上传 ID 匹配且 RequestId 非空；不能只按最后一个 upload ID 做局部计数。
 
-  wait_api_retry_config() {
-    local expected=$1
-    local ready=0
-    local attempt
-    for attempt in $(seq 1 60); do
-      if curl --fail --silent --show-error --connect-timeout 5 --max-time 10 \
-        --proto '=https' "$API_URL/ready" >/dev/null 2>&1 &&
-        railway_cli ssh --service api --environment production \
-          python - "$expected" <<'PY'
-import os
-import sys
-
-if os.environ.get("TENCENTCLOUD_OCR_MAX_RETRIES") != sys.argv[1]:
-    raise SystemExit(1)
-PY
-      then
-        ready=1
-        break
-      fi
-      sleep 2
-    done
-    test "$ready" = 1
-  }
-
-  restore_tencent_retries() {
-    local original_status=$?
-    local restore_status=0
-    trap - EXIT HUP INT TERM
-    if [[ "$retry_override_started" = 1 ]]; then
-      set +e
-      railway_cli variable set \
-        --service api --environment production --skip-deploys \
-        TENCENTCLOUD_OCR_MAX_RETRIES=2 >/dev/null &&
-        railway_cli redeploy \
-          --service api --environment production --yes &&
-        wait_api_retry_config 2
-      restore_status=$?
-      set -e
-    fi
-    if [[ "$restore_status" != 0 ]]; then
-      echo 'STOP: failed to restore and verify Tencent OCR retries=2' >&2
-      exit 1
-    fi
-    exit "$original_status"
-  }
-
-  trap restore_tencent_retries EXIT
-  trap 'exit 130' HUP INT TERM
-  retry_override_started=1
-  railway_cli variable set \
-    --service api --environment production --skip-deploys \
-    TENCENTCLOUD_OCR_MAX_RETRIES=0 >/dev/null
-  railway_cli redeploy --service api --environment production --yes
-  wait_api_retry_config 0
-
-  SMOKE_PASSWORD=$(<"$secret_file") \
-  EXPECTED_OCR_PROVIDER=tencent_question_split \
-  SMOKE_IMAGE_PATH="$SMOKE_IMAGE_PATH" \
-  WEB_URL="$WEB_URL" API_URL="$API_URL" SMOKE_STATE_FILE="$real_state_file" \
-    bash scripts/production-smoke.sh
-)
-
-# 只有真实调用和 retries=2 恢复验证都成功后，才用真实 smoke 的状态
-# 原子替换首次 Mock 状态；后续重启复验因此只读取这次已保存的上传和题目。
-mv -f -- "$real_state_file" "$state_file"
-real_state_file=""
-```
-
-真实付费 smoke 使用 `$run_tmp` 中独立的 mode-0600 `real_state_file`，不会复用首次 Mock smoke 已写入的非空 `state_file`。子 shell 成功返回只表示真实调用和恢复验证都通过；此时才把真实结果原子替换为后续复验使用的 `state_file`。失败或中断时，外层 EXIT trap 会随 `$run_tmp` 安全清理两份状态文件；同时也必须看到 retries 恢复验证完成，否则先人工恢复 `TENCENTCLOUD_OCR_MAX_RETRIES=2`、重新部署并用同一 SSH 断言确认，不能重跑付费 smoke。不要在重启持久性复验中重复运行真实 OCR；真实 Provider 的一次调用证据完成后，后续只读取该次已保存的上传和题目。
+真实调用成功且 live/2 验证通过后，只保留受限临时密码与状态供 Chrome 只读验收。Chrome 和数据库单任务复核结束后立即删除这些临时文件。失败时删除密码；如 one-shot 标记已经消费，保留非敏感标记用于阻止同一工作流误重跑。不要在重启持久性复验中重复运行真实 OCR。
 
 不要退出当前 shell。保留这两个临时文件仅用于后续 API/Postgres 重启持久性与 Chrome 验收；不要打印密码或 Cookie。`state_file` 只允许包含 smoke 邮箱、上传 UUID 和题目 UUID。
 

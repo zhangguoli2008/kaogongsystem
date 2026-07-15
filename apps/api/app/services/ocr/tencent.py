@@ -11,6 +11,7 @@ import anyio
 from tencentcloud.common import credential
 from tencentcloud.common.profile.client_profile import ClientProfile
 from tencentcloud.common.profile.http_profile import HttpProfile
+from tencentcloud.common.retry import NoopRetryer
 from tencentcloud.ocr.v20181119 import models, ocr_client
 
 from app.core.config import Settings
@@ -70,7 +71,10 @@ class TencentOCRProvider:
             endpoint=ENDPOINT,
             reqTimeout=self._settings.tencentcloud_ocr_timeout_seconds,
         )
-        client_profile = ClientProfile(httpProfile=http_profile)
+        client_profile = ClientProfile(
+            httpProfile=http_profile,
+            retryer=NoopRetryer(),
+        )
         self._client = ocr_client.OcrClient(
             cloud_credential,
             self._settings.tencentcloud_region,
